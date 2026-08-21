@@ -9,6 +9,7 @@
   用户手动缩放/平移后 pyqtgraph 自动停跟随 (还原用「适应」按钮)。
 """
 
+import os
 import threading
 from datetime import datetime
 
@@ -18,7 +19,7 @@ from PyQt5.QtWidgets import (
     QLabel, QComboBox, QCheckBox, QPushButton,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QIcon
 
 from config import (
     CHART_COLOR_CANDLE_UP, CHART_COLOR_CANDLE_DOWN,
@@ -28,6 +29,7 @@ from config import (
     COLOR_BORDER, COLOR_ACCENT, COLOR_GREEN, COLOR_RED,
 )
 from widgets.candlestick_item import CandlestickItem
+from widgets.ui_util import disable_ime
 
 try:
     from zoneinfo import ZoneInfo
@@ -69,6 +71,13 @@ class OptionChartWindow(QMainWindow):
         self._closed = False
 
         self.setWindowTitle(f"期权1分图 — {option.display_name} (今日)")
+        # 独立窗口 (parent=None) 不吃主窗口的图标, 不显式设就是 pythonw 的默认图标 ——
+        # 每次切换合约弹出来的"python 加载窗口"就是它。
+        _icon = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.ico"
+        )
+        if os.path.exists(_icon):
+            self.setWindowIcon(QIcon(_icon))
         self.setMinimumSize(700, 420)
         self.resize(950, 560)
         # 关闭即销毁 → destroyed 信号让主窗口把本窗从 _chart_windows 列表移除
@@ -76,6 +85,7 @@ class OptionChartWindow(QMainWindow):
 
         self._build_ui()
         self._apply_style()
+        disable_ime(self)   # 见 ui_util: 别让搜狗挂上来
         self._bars_loaded.connect(self._on_bars)
 
         self._timer = QTimer(self)
@@ -85,6 +95,22 @@ class OptionChartWindow(QMainWindow):
 
     def show_and_load(self):
         self.show()
+        self._load()
+
+    def set_option(self, option):
+        """就地换合约 —— 不销毁重建窗口。
+
+        原先双击另一个合约是 close() 旧窗 + new 一个新窗: 每次都要重建 pyqtgraph
+        的两个 PlotWidget、重跑一遍 _build_ui/_apply_style, 还会在任务栏闪一个新窗口。
+        就地换只留下真正必需的那部分开销 —— 拉历史数据。
+        """
+        self._option = option
+        self._loading = False        # 旧合约那次请求的结果由 _on_bars 按 _option 丢弃
+        self._first_load_done = False  # 新合约重新自适应坐标轴
+        self.setWindowTitle(f"期权1分图 — {option.display_name} (今日)")
+        self._name_label.setText(option.display_name)
+        self._ohlc_label.setText("--")
+        self._status_label.setText("加载中…")
         self._load()
 
     # ── UI ────────────────────────────────────────────────────────────
@@ -103,6 +129,7 @@ class OptionChartWindow(QMainWindow):
         name.setStyleSheet(
             f"color: {COLOR_ACCENT}; font-size: 13px; font-weight: bold; border: none;"
         )
+        self._name_label = name   # set_option 换合约时要改它
         bar.addWidget(name)
 
         self._src_combo = QComboBox()
@@ -197,6 +224,10 @@ class OptionChartWindow(QMainWindow):
         self._status_label.setText("加载中…")
         o = self._option
         what = self._src_combo.currentData()
+        # 换合约后旧请求可能还在路上 (历史数据 timeout 给到 25 秒), 回来时窗口已经在
+        # 显示新合约了 —— 用序号把迟到的结果丢掉, 否则会把上一个合约的 K 线画上去。
+        self._load_seq = getattr(self, "_load_seq", 0) + 1
+        seq = self._load_seq
 
         def worker():
             try:
@@ -208,6 +239,8 @@ class OptionChartWindow(QMainWindow):
                 err = ""
             except Exception as e:
                 bars, err = [], str(e)
+            if seq != getattr(self, "_load_seq", seq):
+                return  # 已经切到别的合约了, 这份数据作废
             try:
                 self._bars_loaded.emit(bars, err)
             except RuntimeError:

@@ -10,7 +10,7 @@ from PyQt5.QtGui import QFont
 from config import (
     DEFAULT_SYMBOLS, COLOR_GREEN, COLOR_RED, COLOR_ACCENT, COLOR_TEXT,
     COLOR_BG_DARK, COLOR_BORDER, COLOR_BG_PANEL, COLOR_TEXT_DIM,
-    FUTURES_SPECS, FUTURES_SYMBOLS,
+    COLOR_ACCENT_HOVER, FUTURES_SPECS, FUTURES_SYMBOLS,
 )
 from models import TradingMode
 
@@ -19,6 +19,7 @@ class SymbolBar(QWidget):
     """Top toolbar with symbol search, mode switch, connection status."""
 
     symbol_changed = pyqtSignal(str)
+    theme_changed = pyqtSignal(str)  # "classic" / "scifi" — 重启后生效
     mode_changed = pyqtSignal(str)  # TradingMode.value: "Paper"/"IBKRPaper"/"Live"
     connect_clicked = pyqtSignal()
     disconnect_clicked = pyqtSignal()
@@ -160,7 +161,7 @@ class SymbolBar(QWidget):
                 font-weight: bold;
             }}
             QPushButton:hover {{
-                background-color: #0097a7;
+                background-color: {COLOR_ACCENT_HOVER};
             }}
         """)
         layout.addWidget(self.connect_btn)
@@ -178,6 +179,27 @@ class SymbolBar(QWidget):
             f"color: {COLOR_ACCENT}; font-size: 14px; font-weight: bold;"
         )
         layout.addWidget(self.current_symbol_label)
+
+        layout.addSpacing(16)
+
+        # ── 主题切换 (经典 / 科幻) — 保存后重启生效 ──
+        from config import THEME_NAME
+        self.theme_combo = QComboBox()
+        for label, val in (("经典", "classic"), ("科幻", "scifi"), ("亮色", "light")):
+            self.theme_combo.addItem(label, val)
+        idx = self.theme_combo.findData(THEME_NAME)
+        if idx >= 0:
+            self.theme_combo.setCurrentIndex(idx)
+        self.theme_combo.setFixedWidth(64)
+        self.theme_combo.setToolTip("界面主题: 经典深蓝 / 简约科幻 / 亮色\n切换后重启程序生效")
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        layout.addWidget(QLabel("主题:"))
+        layout.addWidget(self.theme_combo)
+
+    def _on_theme_changed(self, index: int):
+        name = self.theme_combo.itemData(index)
+        if name:
+            self.theme_changed.emit(name)
 
     # ── Engine integration ────────────────────────────────────────────
 
@@ -367,7 +389,7 @@ class SymbolBar(QWidget):
                     border-radius: 3px;
                     font-weight: bold;
                 }}
-                QPushButton:hover {{ background-color: #0097a7; }}
+                QPushButton:hover {{ background-color: {COLOR_ACCENT_HOVER}; }}
             """)
 
     def set_switching(self, switching: bool):

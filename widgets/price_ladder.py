@@ -13,6 +13,7 @@ Layout (top to bottom):
 
 import re
 import threading
+import time
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -29,8 +30,23 @@ from config import (
     COLOR_BUTTON_DISABLED, COLOR_BG_DARK, COLOR_BORDER, COLOR_BG,
     COLOR_BG_PANEL, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
     COLOR_DEPTH_BID, COLOR_DEPTH_ASK, COLOR_MY_ORDER, FUTURES_SPECS,
+    FONT_FAMILY, COLOR_ACCENT_HOVER,
+    COLOR_BID_PRICE_BG, COLOR_BID_PRICE_FG, COLOR_ASK_PRICE_BG, COLOR_ASK_PRICE_FG,
+    COLOR_DEPTH_BID_ROW, COLOR_DEPTH_ASK_ROW,
+    COLOR_DEPTH_BID_BAR_HL, COLOR_DEPTH_ASK_BAR_HL,
+    COLOR_BID_TEXT_HL, COLOR_ASK_TEXT_HL,
 )
 from models import OptionInfo, OrderAction
+
+
+# ── 行情线停摆自愈 ────────────────────────────────────────────────────
+# IBKR 会在若干情况下悄悄掐掉一条行情线而**不给任何回调**: 行情线用尽(101)、
+# farm 断线重连、1101 恢复后订阅丢失、Gateway 侧的会话竞争。API 侧 reqId 依然
+# "有效", 只是永远不再推 tick —— 界面就停在最后一次报价上, 看起来像被锁死。
+# 这里用「本合约多久没 tick」对比「全局多久没 tick」来识别: 别的合约还在推、
+# 唯独这条不动 = 线死了, 自动重订。
+STALE_TICK_SECS = 20.0       # 本合约超过这么久没 tick 视为可疑
+RESUB_MIN_INTERVAL = 30.0    # 两次自动重订之间的最小间隔 (避免疯狂重订)
 
 
 def parse_option_string(text: str) -> OptionInfo | None:
@@ -62,18 +78,18 @@ def _depth_palette() -> dict:
     if not _DEPTH_PALETTE:
         _DEPTH_PALETTE.update({
             "bg_dark":        QColor(COLOR_BG_DARK),
-            "bid_hl_bg":      QColor("#1a3a2a"),
-            "ask_hl_bg":      QColor("#3a1a1a"),
+            "bid_hl_bg":      QColor(COLOR_DEPTH_BID_ROW),
+            "ask_hl_bg":      QColor(COLOR_DEPTH_ASK_ROW),
             "bid_bar":        QColor(COLOR_DEPTH_BID),
             "ask_bar":        QColor(COLOR_DEPTH_ASK),
-            "bid_bar_hl":     QColor("#2a8a4a"),
-            "ask_bar_hl":     QColor("#8a2a2a"),
+            "bid_bar_hl":     QColor(COLOR_DEPTH_BID_BAR_HL),
+            "ask_bar_hl":     QColor(COLOR_DEPTH_ASK_BAR_HL),
             "border":         QColor(COLOR_BORDER),
             "bid_text":       QColor(COLOR_GREEN),
             "ask_text":       QColor(COLOR_RED),
-            "bid_text_hl":    QColor("#00ff88"),
-            "ask_text_hl":    QColor("#ff6666"),
-            "font":           QFont("Segoe UI", 10),
+            "bid_text_hl":    QColor(COLOR_BID_TEXT_HL),
+            "ask_text_hl":    QColor(COLOR_ASK_TEXT_HL),
+            "font":           QFont(FONT_FAMILY, 10),
         })
     return _DEPTH_PALETTE
 
@@ -258,8 +274,8 @@ class PriceLadderRow(QWidget):
         if self._is_ask:
             self.price_label.setStyleSheet(f"""
                 QLabel {{
-                    background-color: #3a2a00;
-                    color: #ffff00;
+                    background-color: {COLOR_ASK_PRICE_BG};
+                    color: {COLOR_ASK_PRICE_FG};
                     border: 1px solid {COLOR_BORDER};
                     font-size: 12px;
                     font-weight: bold;
@@ -268,8 +284,8 @@ class PriceLadderRow(QWidget):
         elif self._is_bid:
             self.price_label.setStyleSheet(f"""
                 QLabel {{
-                    background-color: #003a3a;
-                    color: #00e5ff;
+                    background-color: {COLOR_BID_PRICE_BG};
+                    color: {COLOR_BID_PRICE_FG};
                     border: 1px solid {COLOR_BORDER};
                     font-size: 12px;
                     font-weight: bold;
@@ -331,6 +347,9 @@ class PriceLadder(QWidget):
         # socket.send 卡住 GUI 线程 (表现为切标的时窗口"未响应"灰屏)。代数计数器
         # 保证只有最近一次切换的订阅被保留, 快速连切不会泄漏行情线。
         self._sub_generation = 0
+        # 行情线停摆自愈状态 (见文件顶部 STALE_TICK_SECS 说明)
+        self._last_auto_resub = 0.0   # 上次自动重订的时间戳
+        self._stale_shown = False     # 标题栏是否已显示"行情停滞"
 
         # Cache last known valid bid/ask to survive momentary data gaps
         self._last_bid = 0.0
@@ -754,6 +773,11 @@ class PriceLadder(QWidget):
         """Set a callable that returns current quantity (kept for compatibility)."""
         self._quantity_fn = fn
 
+    def reset_quantity(self):
+        """把下单数量复位为 1 (每次买入/卖出提交成功后由 MainWindow 调用,
+        防止上一笔的大数量残留到下一笔误下)。"""
+        self.qty_spin.setValue(1)
+
     def get_quantity(self) -> int:
         """Get current quantity from the integrated spinner."""
         return self.qty_spin.value()
@@ -855,12 +879,32 @@ class PriceLadder(QWidget):
         ul_row.setSpacing(4)
         self.ul_check = QCheckBox("标的价")
         self.ul_check.setToolTip(
-            "监控**标的**价格(如 SPX), 到达触发价即对本期权发**市价卖出**(按下方「数量」)。\n"
+            "监控某个**标的**价格, 到达触发价即对本期权发**市价卖出**(按下方「数量」)。\n"
+            "监控标的默认是本期权自己的标的; 也可选/输入其它代码\n"
+            "(如 SPY 期权盯 SPX 或 ES 到价卖出)。\n"
             "例: 买了 SPX 7500C, 设「≥ 7510」→ SPX 涨到 7510 自动市价卖出。\n"
             "本地监控(仅程序运行时有效), 触发后走市价单。"
         )
         self.ul_check.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 11px; font-weight: bold; border: none;")
         ul_row.addWidget(self.ul_check)
+        # 监控标的选择: 「自己」= 本期权的标的 (默认); 可选/输入其它代码
+        self.ul_sym_combo = QComboBox()
+        self.ul_sym_combo.setEditable(True)
+        self.ul_sym_combo.addItems(["自己", "SPX", "SPY", "ES", "NQ", "QQQ", "XSP", "NDX"])
+        self.ul_sym_combo.setFixedWidth(64)
+        self.ul_sym_combo.setToolTip(
+            "监控哪个标的的价格 (自己 = 本期权的标的)。\n"
+            "可输入任意代码; ES/NQ 等期货自动取近月合约。")
+        self.ul_sym_combo.setStyleSheet(
+            f"QComboBox {{ background-color: {COLOR_BG}; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 3px; padding: 2px; }}"
+        )
+        self._ul_seed_req = None   # 换监控标的时为播种临时订阅的 reqId
+        # 用 activated(下拉选择) + editingFinished(手输回车/失焦) 而非
+        # currentTextChanged: 后者打字每个字母都触发, 会对 "E"/"ES" 逐个订阅
+        self.ul_sym_combo.activated.connect(self._on_ul_sym_changed)
+        self.ul_sym_combo.lineEdit().editingFinished.connect(self._on_ul_sym_changed)
+        ul_row.addWidget(self.ul_sym_combo)
         self.ul_dir_combo = QComboBox()
         self.ul_dir_combo.addItem("≥ 涨到", "UP")
         self.ul_dir_combo.addItem("≤ 跌到", "DOWN")
@@ -904,7 +948,7 @@ class PriceLadder(QWidget):
         self.arm_btn.setStyleSheet(f"""
             QPushButton {{ background-color: {COLOR_ACCENT}; color: white; border: none;
                 border-radius: 3px; font-weight: bold; font-size: 11px; padding: 2px 12px; }}
-            QPushButton:hover {{ background-color: #0097a7; }}
+            QPushButton:hover {{ background-color: {COLOR_ACCENT_HOVER}; }}
         """)
         self.arm_btn.clicked.connect(self._on_arm_conditional)
         opt_row.addWidget(self.arm_btn)
@@ -981,23 +1025,66 @@ class PriceLadder(QWidget):
         self.cond_panel.setVisible(checked)
         self.cond_toggle_btn.setText("条件单 ▴" if checked else "条件单 ▾")
         # 打开时用现价播种触发价输入框 (方便微调)。期货是「点数」语义, 不按现价播种。
-        if checked and self._option and self._engine and not self._is_futures():
-            tick = self._engine.get_tick(self._option.to_ibkr_key())
-            cur = tick.get("last", 0) or ((tick.get("bid", 0) + tick.get("ask", 0)) / 2
-                                          if tick.get("bid") and tick.get("ask") else 0)
-            if cur > 0:
-                if self.tp_price_spin.value() == 0:
-                    self.tp_price_spin.setValue(round(cur * 1.2, 2))
-                if self.sl_price_spin.value() == 0:
-                    self.sl_price_spin.setValue(round(cur * 0.85, 2))
-            # 标的价触发: 用当前标的价播种, 方向按 CALL=涨到/PUT=跌到 默认
-            if self._option.right in ("C", "P"):
-                self.ul_dir_combo.setCurrentIndex(1 if self._option.right == "P" else 0)
-                und = self._engine.get_tick(f"__stock__{self._option.symbol}")
-                und_px = und.get("last", 0) or ((und.get("bid", 0) + und.get("ask", 0)) / 2
-                                                if und.get("bid") and und.get("ask") else 0)
-                if und_px > 0 and self.ul_price_spin.value() == 0:
-                    self.ul_price_spin.setValue(round(und_px, 2))
+        if checked:
+            self._seed_cond_prices()
+
+    def _seed_cond_prices(self):
+        """用现价播种条件单触发价输入框 (仅在为 0 时填, 不覆盖手填值)。
+        期货是「点数」语义不播种。"""
+        if not (self._option and self._engine) or self._is_futures():
+            return
+        tick = self._engine.get_tick(self._option.to_ibkr_key())
+        cur = tick.get("last", 0) or ((tick.get("bid", 0) + tick.get("ask", 0)) / 2
+                                      if tick.get("bid") and tick.get("ask") else 0)
+        if cur > 0:
+            if self.tp_price_spin.value() == 0:
+                self.tp_price_spin.setValue(round(cur * 1.2, 2))
+            if self.sl_price_spin.value() == 0:
+                self.sl_price_spin.setValue(round(cur * 0.85, 2))
+        # 标的价触发: 用所选监控标的现价播种, 方向按 CALL=涨到/PUT=跌到 默认
+        if self._option.right in ("C", "P"):
+            self.ul_dir_combo.setCurrentIndex(1 if self._option.right == "P" else 0)
+            sym = self._ul_watch_symbol() or self._option.symbol.upper()
+            und = self._engine.get_tick(f"__stock__{sym}")
+            und_px = und.get("last", 0) or ((und.get("bid", 0) + und.get("ask", 0)) / 2
+                                            if und.get("bid") and und.get("ask") else 0)
+            if und_px > 0 and self.ul_price_spin.value() == 0:
+                self.ul_price_spin.setValue(round(und_px, 2))
+
+    def _ul_watch_symbol(self) -> str:
+        """「标的价」监控的标的代码; "" = 本期权自己的标的 (默认)。"""
+        text = (self.ul_sym_combo.currentText() or "").strip().upper()
+        own = self._option.symbol.upper() if self._option else ""
+        if text in ("", "自己") or text == own:
+            return ""
+        return text
+
+    def _drop_ul_seed_subscription(self):
+        if self._ul_seed_req is not None and self._engine:
+            try:
+                self._engine.unsubscribe_tick(self._ul_seed_req)
+            except Exception:
+                pass
+        self._ul_seed_req = None
+
+    def _on_ul_sym_changed(self, _index=None):
+        """换「标的价」监控标的: 旧触发价语义作废 → 清零, 为播种临时订阅
+        新标的行情并重新播种 (换选时退订上一个, 不累积行情线)。"""
+        if self._option is None or self._is_futures():
+            return
+        self.ul_price_spin.setValue(0.0)
+        self._drop_ul_seed_subscription()
+        sym = self._ul_watch_symbol()
+        if sym and self._engine:
+            tick = self._engine.get_tick(f"__stock__{sym}")
+            if not (tick.get("last") or tick.get("bid")):
+                try:
+                    self._ul_seed_req = self._engine.subscribe_watch_tick(sym)
+                except Exception as e:
+                    print(f"[LADDER] 监控标的行情订阅失败 {sym}: {e}", flush=True)
+                # 首个 tick 到达需要时间 (期货还要先解析近月), 稍后补播种
+                QTimer.singleShot(1500, self._seed_cond_prices)
+        self._seed_cond_prices()
 
     def _on_arm_conditional(self):
         if not self._option:
@@ -1023,16 +1110,63 @@ class PriceLadder(QWidget):
         if ul_on and ul_price <= 0:
             QMessageBox.warning(self, "标的价无效", "请填写标的触发价")
             return
+        # 挂单前核对: 条件在**当前价格下已满足**的腿 (挂上 0.5s 内就会发卖单)
+        # → 明确列出并要求确认 (默认 No)。7/10 事故根因: 「标的价」输入框以当前
+        # 标的价播种 + 勾选残留, 挂止盈/止损时静默带出一条已到价的市价卖单。
+        # 期货为相对点数、行情缺失时无法核对, 均跳过。
+        if not by_points:
+            warns = []
+            tick = (self._engine.get_tick(self._option.to_ibkr_key())
+                    if self._engine else {})
+            cur = tick.get("last", 0) or ((tick.get("bid", 0) + tick.get("ask", 0)) / 2
+                                          if tick.get("bid") and tick.get("ask") else 0)
+            if cur > 0:
+                if tp_on and cur >= tp_price:
+                    warns.append(f"止盈: 现价 {cur:.2f} 已 ≥ 触发价 {tp_price:.2f}")
+                if sl_on and cur <= sl_price:
+                    warns.append(f"止损: 现价 {cur:.2f} 已 ≤ 触发价 {sl_price:.2f}")
+            if ul_on:
+                ul_sym = self._ul_watch_symbol() or self._option.symbol.upper()
+                und = (self._engine.get_tick(f"__stock__{ul_sym}")
+                       if self._engine else {})
+                und_px = und.get("last", 0) or ((und.get("bid", 0) + und.get("ask", 0)) / 2
+                                                if und.get("bid") and und.get("ask") else 0)
+                ul_dir = self.ul_dir_combo.currentData()
+                if und_px > 0 and ((ul_dir == "UP" and und_px >= ul_price)
+                                   or (ul_dir == "DOWN" and und_px <= ul_price)):
+                    arrow = "≥" if ul_dir == "UP" else "≤"
+                    warns.append(f"标的价: {ul_sym} 现价 {und_px:.2f} 已 {arrow} "
+                                 f"触发价 {ul_price:.2f} → 立即市价卖出本期权")
+            if warns:
+                ret = QMessageBox.question(
+                    self, "条件已满足 — 挂上会立即卖出",
+                    "以下条件在当前价格下**已经满足**, 挂上后马上就会发出卖单:\n\n"
+                    + "\n".join(f"• {w}" for w in warns)
+                    + "\n\n确定要挂吗?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if ret != QMessageBox.Yes:
+                    return
         self.conditional_requested.emit({
             "tp_on": tp_on, "tp_price": tp_price,
             "sl_on": sl_on, "sl_price": sl_price,
             "ul_on": ul_on, "ul_price": ul_price,
             "ul_dir": self.ul_dir_combo.currentData(),
+            "ul_sym": self._ul_watch_symbol(),
             "qty": self.cond_qty_spin.value(),
             "native": self.cond_native_check.isChecked(),
             "outside_rth": self.get_outside_rth(),
             "by_points": by_points,
         })
+        # 挂完取消**全部**勾选 (止盈/止损/标的价) —— 每次挂单都是一次性的明确
+        # 意图, 残留勾选会在下次挂单时被静默重复带出 (7/10 「标的价」残留勾选 +
+        # 现价播种 → 挂止盈/止损时带出已到价的市价卖单, 期权被秒卖)。
+        # 「标的价」输入框清零、监控标的复位「自己」、退订播种用临时行情。
+        self.tp_check.setChecked(False)
+        self.sl_check.setChecked(False)
+        self.ul_check.setChecked(False)
+        self.ul_price_spin.setValue(0.0)
+        self.ul_sym_combo.setCurrentIndex(0)
+        self._drop_ul_seed_subscription()
 
     def set_conditionals(self, conds: list):
         """刷新「已挂本地条件单」列表 (conds: list[ConditionalOrder])。"""
@@ -1056,8 +1190,9 @@ class PriceLadder(QWidget):
                 color = COLOR_RED
             arrow = "≥" if c._trigger_dir() == "UP" else "≤"
             if c.kind == "UL":
-                # 标的价触发 → 市价卖出
-                lbl = QLabel(f"标的 {arrow}{c.trigger_price:.2f} → 市价卖 {c.quantity} [本地]")
+                # 标的价触发 → 市价卖出 (显示监控的是哪个标的)
+                sym = c.watch_symbol or c.option.symbol
+                lbl = QLabel(f"{sym} {arrow}{c.trigger_price:.2f} → 市价卖 {c.quantity} [本地]")
             else:
                 dst = "市价" if c.market else f"限{c.limit_price:.2f}"
                 lbl = QLabel(f"{c.kind_label} SELL {c.quantity} {arrow}{c.trigger_price:.2f} "
@@ -1094,6 +1229,19 @@ class PriceLadder(QWidget):
         self.search_input.setText("")
         # 期货条件单用「点数」表示 (相对买入/持仓均价); 其它用绝对触发价
         self._sync_cond_input_mode()
+        # 换合约: 旧合约的绝对触发价/勾选全部作废 (0.95 对新合约是另一个意思),
+        # 清零后若面板开着按新合约现价重新播种。期货点数是相对值, 不清。
+        if not self._is_futures() and hasattr(self, "tp_price_spin"):
+            self.tp_check.setChecked(False)
+            self.sl_check.setChecked(False)
+            self.ul_check.setChecked(False)
+            self.tp_price_spin.setValue(0.0)
+            self.sl_price_spin.setValue(0.0)
+            self.ul_price_spin.setValue(0.0)
+            self.ul_sym_combo.setCurrentIndex(0)   # 监控标的复位「自己」
+            self._drop_ul_seed_subscription()
+            if self.cond_panel.isVisible():
+                self._seed_cond_prices()
 
         # Reset depth data
         self._depth_bids.clear()
@@ -1106,32 +1254,60 @@ class PriceLadder(QWidget):
         self._last_bid_map = {}
         self._last_ask_map = {}
 
-        if self._engine:
-            # 退订旧行情 + 订阅新行情都走后台线程: 这些是 IBKR socket 调用,
-            # Gateway 繁忙时会阻塞数秒, 放后台可让切标的瞬间完成、GUI 不卡。
-            self._sub_generation += 1
-            gen = self._sub_generation
-            eng = self._engine
-            old_req = self._tick_req_id
-            self._tick_req_id = None
-            threading.Thread(
-                target=self._resubscribe_worker,
-                args=(eng, option, old_req, gen),
-                daemon=True,
-            ).start()
+        self._start_tick_subscription(option)
 
         self._rebuild_ladder()
         self.option_loaded.emit()
 
+    def _start_tick_subscription(self, option: OptionInfo, reset_stale: bool = True):
+        """(重新)订阅当前合约的盘口 + tick。切合约与停摆自愈共用。
+
+        reset_stale=False 用于自愈重订: 保留「行情停滞」提示, 直到真的收到 tick
+        才由 `_check_tick_stale` 清掉 —— 否则重订一次就把警示抹掉, 用户仍会对着
+        一个旧价格下单。
+        """
+        if not self._engine:
+            return
+        # 退订旧行情 + 订阅新行情都走后台线程: 这些是 IBKR socket 调用,
+        # Gateway 繁忙时会阻塞数秒, 放后台可让切标的瞬间完成、GUI 不卡。
+        self._sub_generation += 1
+        gen = self._sub_generation
+        eng = self._engine
+        old_req = self._tick_req_id
+        self._tick_req_id = None
+        # 重订后给一个宽限期再判定停滞, 免得刚发出请求就被当成又死了
+        self._last_auto_resub = time.time()
+        if reset_stale:
+            self._set_stale_indicator(False)
+        threading.Thread(
+            target=self._resubscribe_worker,
+            args=(eng, option, old_req, gen),
+            daemon=True,
+        ).start()
+
     def _resubscribe_worker(self, eng, option, old_req, gen: int):
         """后台线程: 退订旧 tick + 订阅新合约的盘口/tick。
-        仅当本次仍是最近一次切换 (代数匹配) 才保留 reqId, 否则立即退订, 防泄漏。"""
+        仅当本次仍是最近一次切换 (代数匹配) 才保留 reqId, 否则立即退订, 防泄漏。
+
+        三段各自 try: **盘口(深度)失败绝不能连累 tick 订阅** —— 深度对不少标的
+        本来就不支持 (10092/200), 早先的写法把三步包在一个 try 里, 深度一抛异常
+        就 return, tick 订阅根本没发出去, 点价梯于是永远停在旧价格上 (本次 bug
+        的另一主因), 而且 except 是静默的, 日志里查不到任何线索。
+        """
         try:
             if old_req is not None:
                 eng.unsubscribe_tick(old_req)
+        except Exception as e:
+            print(f"[LADDER] 退订旧行情失败 reqId={old_req}: {e}", flush=True)
+        try:
             eng.subscribe_market_depth(option)
+        except Exception as e:
+            print(f"[LADDER] {option.display_name} 盘口订阅失败 (不影响报价): {e}",
+                  flush=True)
+        try:
             rid = eng.subscribe_option_tick(option)
-        except Exception:
+        except Exception as e:
+            print(f"[LADDER] {option.display_name} 行情订阅失败: {e}", flush=True)
             return
         if gen == self._sub_generation:
             self._tick_req_id = rid
@@ -1297,12 +1473,73 @@ class PriceLadder(QWidget):
             if position < len(target):
                 target.pop(position)
 
+    def _check_tick_stale(self, key: str):
+        """本合约行情线是否已停摆? 是则自动重订, 并在标题上标出来。
+
+        判据: 全局还在收 tick (别的合约在推) 而本合约超过 STALE_TICK_SECS 没动。
+        全局也不动时不处理 —— 那是整体断流或收盘, 由引擎心跳/重连负责。
+        """
+        eng = self._engine
+        if eng is None or self._option is None:
+            return
+        if not getattr(eng, "is_connected", False):
+            return
+        age_fn = getattr(eng, "tick_age", None)
+        req_age_fn = getattr(eng, "req_tick_age", None)
+        global_fn = getattr(eng, "market_data_age", None)
+        if age_fn is None or global_fn is None:
+            return  # 老引擎/模拟引擎没有该接口 → 不做自愈
+
+        # 优先看**自己这条行情线**的年龄。合约级年龄会被期权链的一次性快照
+        # 刷新 —— 常驻订阅早被 IBKR 拒掉 (322 duplicate ticker id) 或掐掉了,
+        # 合约级时间戳却一直是新的, 于是停摆检测永远不触发, 界面就那么卡着。
+        if req_age_fn is not None and self._tick_req_id is not None:
+            age = req_age_fn(self._tick_req_id)
+        else:
+            age = age_fn(key)
+        if age < STALE_TICK_SECS:
+            self._set_stale_indicator(False)
+            return
+        now = time.time()
+        if now - self._last_auto_resub < STALE_TICK_SECS:
+            return  # 刚订阅/刚重订, 还在宽限期内 (首个 tick 本来就要等一会)
+        if global_fn() > STALE_TICK_SECS:
+            return  # 全局都没数据 = 整体断流/收盘, 不是这条线的问题
+
+        self._set_stale_indicator(True)
+
+        if now - self._last_auto_resub < RESUB_MIN_INTERVAL:
+            return
+        age_txt = "从未收到" if age == float("inf") else f"{age:.0f}s 无更新"
+        print(f"[LADDER] {self._option.display_name} 行情线停摆 ({age_txt}), "
+              f"全局仍在收数据 → 自动重订", flush=True)
+        # 退旧线 + 换新 reqId 重订 (走既有的后台线程路径: socket 调用不卡 GUI,
+        # 也避开同一 reqId 立刻复用可能撞上的 102 duplicate ticker id)
+        self._start_tick_subscription(self._option, reset_stale=False)
+
+    def _set_stale_indicator(self, stale: bool):
+        """标题页签上标出「行情停滞」, 让停在旧价格上的界面一眼可见, 不至于
+        对着一个几分钟前的价格下单。"""
+        if stale == self._stale_shown:
+            return
+        self._stale_shown = stale
+        if stale:
+            self.title_tab.setText("点价交易 ⚠ 行情停滞·重订中")
+            self.title_tab.setToolTip(
+                "该合约行情线已停止推送 (其它合约仍在更新), 正在自动重订。\n"
+                "当前显示的是最后一次收到的报价, 可能已过时。"
+            )
+        else:
+            self.title_tab.setText("点价交易")
+            self.title_tab.setToolTip("")
+
     def _refresh(self):
         """Update bid/ask highlights, depth, position summary, and button states."""
         if not self._option or not self._engine:
             return
 
         key = self._option.to_ibkr_key()
+        self._check_tick_stale(key)
         tick = self._engine.get_tick(key)
         bid = tick.get("bid", 0)
         ask = tick.get("ask", 0)
@@ -1659,3 +1896,4 @@ class PriceLadder(QWidget):
             if self._tick_req_id is not None:
                 self._engine.unsubscribe_tick(self._tick_req_id)
                 self._tick_req_id = None
+            self._drop_ul_seed_subscription()

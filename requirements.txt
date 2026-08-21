@@ -1,0 +1,16 @@
+# IBKR 点价交易 GUI (PyQt5)
+#
+# ibapi 只在 PyPI 上有 9.81.1；IBKR 官网的 10.x 回调签名不同 (error 多 errorTime,
+# 数量 int→Decimal)，勿混装。
+ibapi==9.81.1.post1
+PyQt5==5.15.11
+
+# 图表 (ChartWindow 延迟导入)
+numpy==2.3.3
+pyqtgraph==0.14.0
+
+# single_instance.py 进程检测
+psutil==7.2.2
+
+# Windows 上 zoneinfo 需要 IANA 时区库
+tzdata==2025.2

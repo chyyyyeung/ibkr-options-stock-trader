@@ -16,7 +16,7 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.execution import ExecutionFilter
 
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+from PyQt5.QtCore import QObject, pyqtSignal, QTimer, QThread, QMetaObject, Qt
 
 from config import (
     IBKR_HOST, IBKR_PAPER_PORT, IBKR_LIVE_PORT,
@@ -96,6 +96,17 @@ class IBKRSignalBridge(QObject):
 
 # ── IBKR API App ─────────────────────────────────────────────────────
 
+# **进程级** reqId 计数器 —— 绝不能跟着 IBKRApp 实例复位。
+#
+# connect() 每次 (含重连、实盘↔模拟切换、326 换 clientId 重试) 都新建一个
+# IBKRApp。计数器若随实例回到 1000, 而 Gateway 仍持有上一次连接 (同 clientId)
+# 的行情订阅, 新的 reqMktData 就会撞上已在用的 tickerId, IBKR 直接回
+# 「322 Duplicate ticker id」把这次订阅**拒掉** —— 那条行情线永远不推数据,
+# 点价梯就永远停在最后一次报价上。这正是"某些标的点价交易卡住"的根因。
+_REQ_ID_LOCK = threading.Lock()
+_REQ_ID_SEQ = 1000
+
+
 class IBKRApp(EWrapper, EClient):
     """EWrapper + EClient with callbacks for option chain, ticks, orders."""
 
@@ -121,6 +132,11 @@ class IBKRApp(EWrapper, EClient):
         self._tick_data: dict[str, dict] = {}  # key -> {bid, ask, last}
         # reqId -> (contract, generic_ticks) 供"未订阅实时行情"时切延迟后重订
         self._tick_req_contract: dict[int, tuple] = {}
+        # reqId -> 该**行情线**最后一次收到 tick 的时刻 (判断这条线是否已死;
+        # 不能用合约级时间戳, 会被期权链的快照刷新掩盖 — 见 _touch_tick)
+        self._tick_req_last: dict[int, float] = {}
+        # key -> 因 322 重订的次数 (防止一直撞车时无限重试)
+        self._tick_retry: dict[str, int] = {}
 
         # Active subscriptions for cleanup
         self._active_mkt_data_reqs: set[int] = set()
@@ -160,6 +176,18 @@ class IBKRApp(EWrapper, EClient):
         self._exec_cf: dict[str, float] = {}
         self._posval: dict[int, float] = {}
         self._comm_by_execid: dict[str, float] = {}
+        # execId -> 手续费计价货币 (commissionReport.currency)。非美元标的 (如台股)
+        # 的佣金按当地货币计 (TWD), 显示前需按持仓汇率折成 USD, 否则「费$40」其实是
+        # 40 TWD 被误当成美元。
+        self._comm_ccy_by_execid: dict[str, str] = {}
+        # 币种 → **账户基础货币** 汇率, 来自 ledger 的 ExchangeRate 标签
+        # ($LEDGER:ALL 每种持有货币推一行)。注意方向: 是"→基础货币"而不是"→USD",
+        # 换 USD 统一走 IBKREngine.to_usd_rate。
+        # **不能**预置 {"USD": 1.0} —— 那等于断言账户基础货币就是 USD, 在非 USD 账户上
+        # 会让 to_usd_rate 在 ledger 到达前算出错得离谱的值。宁可先返回"未知"。
+        self._fx_rates: dict[str, float] = {}
+        # 账户基础货币 (accountSummary 的 NetLiquidation 行带的 currency)
+        self._base_currency: str = ""
         # execId -> conId (execDetails 记录), 用于把 commissionReport 的佣金
         # 归到具体合约 → 点价梯/持仓面板显示该合约今日实际已付手续费
         self._exec_conid: dict[str, int] = {}
@@ -176,9 +204,12 @@ class IBKRApp(EWrapper, EClient):
         self._hist_data: dict[int, dict] = {}
 
     def next_req_id(self) -> int:
-        with self._req_id_lock:
-            self._req_id += 1
-            return self._req_id
+        """全进程单调递增的 reqId (见 _REQ_ID_SEQ 说明: 不随重连复位)。"""
+        global _REQ_ID_SEQ
+        with _REQ_ID_LOCK:
+            _REQ_ID_SEQ += 1
+            self._req_id = _REQ_ID_SEQ
+            return _REQ_ID_SEQ
 
     def next_order_id(self) -> int:
         with self._order_id_lock:
@@ -209,6 +240,71 @@ class IBKRApp(EWrapper, EClient):
             -1, 10168, "实时行情未订阅 → 已切换为延迟行情 (15分钟延迟)"
         )
 
+    _MAX_TICK_RETRY = 3
+
+    def _retry_tick_with_new_id(self, req_id: int, why: str):
+        """行情订阅被「Duplicate ticker id」拒掉 → 换个全新 reqId 重订同一合约。
+
+        面板持有的旧 reqId 就此作废, 但它们只用它退订 (对已不存在的 id 调
+        cancelMktData 只会引出无害的 300, 已单独静默处理), **显示一律走 key**,
+        所以数据恢复对所有面板同时生效, 不需要面板配合改动。
+        """
+        key = self._tick_req_to_key.pop(req_id, None)
+        ct = self._tick_req_contract.pop(req_id, None)
+        self._active_mkt_data_reqs.discard(req_id)
+        self._tick_req_last.pop(req_id, None)
+        if key is None or ct is None:
+            print(f"[MKTDATA] reqId={req_id} 被拒但已无合约记录, 放弃重订 ({why})",
+                  flush=True)
+            return
+
+        n = self._tick_retry.get(key, 0) + 1
+        if n > self._MAX_TICK_RETRY:
+            print(f"[MKTDATA] {key} 连续 {n-1} 次撞 duplicate ticker id, 停止重订",
+                  flush=True)
+            self.bridge.error_received.emit(
+                req_id, 322, f"{key} 行情订阅反复被拒 — 建议重启 Gateway")
+            return
+        self._tick_retry[key] = n
+
+        contract, gticks = ct
+        new_id = self.next_req_id()
+        self._tick_req_to_key[new_id] = key
+        self._tick_req_contract[new_id] = ct
+        self._active_mkt_data_reqs.add(new_id)
+        try:
+            self.reqMktData(new_id, contract, gticks, False, False, [])
+            print(f"[MKTDATA] {key} 行情订阅被拒 (reqId={req_id}: {why}) "
+                  f"→ 已改用 reqId={new_id} 重订 (第 {n} 次)", flush=True)
+        except Exception as e:
+            self._tick_req_to_key.pop(new_id, None)
+            self._tick_req_contract.pop(new_id, None)
+            self._active_mkt_data_reqs.discard(new_id)
+            print(f"[MKTDATA] {key} 换 id 重订失败: {e}", flush=True)
+
+    def resubscribe_all_ticks(self, reason: str = ""):
+        """把所有**流式**行情线 cancel 后按原 reqId 重订。
+
+        用于 IBKR 报 1101 ("connectivity restored — DATA LOST"): 此时 TWS/Gateway
+        已把之前的行情订阅全部丢弃, 但 API 侧不会有任何回调, 各面板的 reqId 依旧
+        "有效"却永远收不到 tick —— 表现就是点价梯/期权链停在断线前那一刻的价格
+        (界面像被锁死)。复用原 reqId 重订, 面板记录的 reqId 无需变更。
+        """
+        n = 0
+        for req, ct in list(self._tick_req_contract.items()):
+            contract, gticks = ct
+            try:
+                self.cancelMktData(req)
+            except Exception:
+                pass
+            try:
+                self.reqMktData(req, contract, gticks, False, False, [])
+                n += 1
+            except Exception as e:
+                print(f"[RESUB] reqId={req} 重订失败: {e}", flush=True)
+        print(f"[RESUB] 已重订 {n} 条行情线 ({reason})", flush=True)
+        return n
+
     # ── Connection ────────────────────────────────────────────────────
 
     def nextValidId(self, orderId: int):
@@ -234,6 +330,43 @@ class IBKRApp(EWrapper, EClient):
                   f"msg={errorString}", flush=True)
             if advancedOrderRejectJson:
                 print(f"[ORDER REJECT] {advancedOrderRejectJson}", flush=True)
+
+        # 1100/1101/1102: 与 IBKR 服务器的连通性。**1101 = 已恢复但行情订阅丢失**,
+        # 必须把所有行情线重订, 否则各面板的 reqId 永远收不到 tick —— 点价梯就
+        # 停在断线前那一刻的价格不动了 (本次 bug 的主因之一)。
+        # 1102 = 已恢复且订阅保留, 1100 = 断开, 都只记日志。
+        if errorCode in (1100, 1101, 1102):
+            print(f"[CONN] code={errorCode} msg={errorString}", flush=True)
+            if errorCode == 1101:
+                self.resubscribe_all_ticks("1101 连接恢复但行情订阅丢失")
+            self.bridge.error_received.emit(reqId, errorCode, errorString)
+            return
+
+        # 322 / 102 「Duplicate ticker id」—— 本次 reqMktData 被**直接拒绝**,
+        # 这条线一个 tick 都不会来, 面板于是永远停在最后一次报价上 (AAPL 点价梯
+        # 卡死就是这个)。成因: Gateway 还持有上一次连接 (同 clientId) 的同号订阅。
+        # 处理: 换一个全新 reqId 把同一个合约重订上。key 不变, 所有面板都是按 key
+        # 轮询行情的, 所以数据一恢复, 点价梯/期权链/计算器全部同时恢复。
+        if errorCode in (102, 322) and "duplicate ticker" in errorString.lower():
+            if reqId in self._tick_req_to_key:
+                self._retry_tick_with_new_id(reqId, errorString)
+                return
+
+        # 行情线相关的硬错误 —— 这条 reqId 已经死了, IBKR 不会再推任何 tick。
+        # 101   = 行情线用尽 (Max number of tickers has been reached)
+        # 102   = ticker id 重复
+        # 309   = 深度订阅数用尽
+        # 10197 = 有其它会话在用同一份行情 (competing live session)
+        # 以前这些只在状态栏一闪而过、日志里没有任何痕迹, 面板则一直显示旧价格。
+        if errorCode in (101, 102, 309, 10197):
+            key = self._tick_req_to_key.pop(reqId, None)
+            self._active_mkt_data_reqs.discard(reqId)
+            self._tick_req_contract.pop(reqId, None)
+            print(f"[MKTDATA] 行情线失效 reqId={reqId} key={key} "
+                  f"code={errorCode} msg={errorString} "
+                  f"(当前活跃行情线 {len(self._active_mkt_data_reqs)} 条)", flush=True)
+            self.bridge.error_received.emit(reqId, errorCode, errorString)
+            return
 
         # 161 / 10147 / 10148: 撤单类无害响应 —— 订单已不可撤 (多半已成交或已撤) 或
         # 找不到。**不是拒单**: 不弹框、不标 ERROR、不写拒单日志 (否则会把刚成交的单
@@ -323,6 +456,12 @@ class IBKRApp(EWrapper, EClient):
                 store[reqId]["event"].set()
                 return  # handled by waiting thread, don't also spam bridge
 
+        # 兜底: 其余错误以前只在状态栏一闪而过, 日志里毫无痕迹, 事后无法排查
+        # (行情停摆类问题尤其吃亏)。统一落日志; 行情线相关的额外标出 key。
+        tick_key = self._tick_req_to_key.get(reqId)
+        extra = f" key={tick_key}" if tick_key else ""
+        print(f"[API ERROR] reqId={reqId} code={errorCode}{extra} "
+              f"msg={errorString}", flush=True)
         self.bridge.error_received.emit(reqId, errorCode, errorString)
 
     # ── Contract Details ──────────────────────────────────────────────
@@ -356,6 +495,25 @@ class IBKRApp(EWrapper, EClient):
 
     # ── Tick Data ─────────────────────────────────────────────────────
 
+    def _touch_tick(self, key: str, req_id: int) -> dict:
+        """取(或建)该合约的 tick 记录, 盖上合约级/**行情线级**/全局三个时间戳。
+
+        三个粒度各有用处:
+          - `d['t']`   合约级: 这个合约有没有新数据 (谁推的都算)。
+          - `_tick_req_last[req_id]` **行情线级**: 判断"我自己订的这条线是不是
+            死了"必须用它。只看合约级会被**期权链的快照**骗到 —— 快照写的是同一个
+            key, 会不断刷新 `d['t']`, 于是点价梯的常驻订阅早就被 IBKR 拒掉/掐掉了,
+            合约级时间戳却一直是新的, 停摆检测永远不触发 (实测 AAPL 卡死时
+            日志里一条 [LADDER] 都没有, 就是栽在这里)。
+          - `_last_tick_time` 全局: 区分"整体断流/收盘"与"单条线死了"。
+        """
+        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+        now = time.time()
+        d["t"] = now
+        self._tick_req_last[req_id] = now
+        self._last_tick_time = now
+        return d
+
     def tickPrice(self, reqId, tickType, price, attrib):
         if price <= 0 or price != price:
             return
@@ -364,9 +522,7 @@ class IBKRApp(EWrapper, EClient):
         if key is None:
             return
 
-        self._last_tick_time = time.time()
-
-        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+        d = self._touch_tick(key, reqId)
 
         if tickType in (1, 66):     # bid / delayed bid
             d["bid"] = float(price)
@@ -385,7 +541,7 @@ class IBKRApp(EWrapper, EClient):
         key = self._tick_req_to_key.get(reqId)
         if key is None:
             return
-        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+        d = self._touch_tick(key, reqId)
         if tickType in (0, 69):     # bid size / delayed bid size
             d["bid_size"] = int(size)
         elif tickType in (3, 70):   # ask size / delayed ask size
@@ -411,7 +567,7 @@ class IBKRApp(EWrapper, EClient):
         if key is None:
             return
         if tickType == 24 and value is not None and value == value and value > 0:
-            d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+            d = self._touch_tick(key, reqId)
             d["iv"] = float(value)
 
     def tickOptionComputation(
@@ -425,8 +581,7 @@ class IBKRApp(EWrapper, EClient):
         key = self._tick_req_to_key.get(reqId)
         if key is None:
             return
-        self._last_tick_time = time.time()
-        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+        d = self._touch_tick(key, reqId)
 
         def _ok(x):  # 非 None / 非 NaN / 正数 (IBKR 用 NaN 或负值表示无效)
             return x is not None and x == x and x > 0
@@ -637,6 +792,10 @@ class IBKRApp(EWrapper, EClient):
             return
         self._reset_pnl_if_new_day()
         self._comm_by_execid[commissionReport.execId] = commission
+        # 记下佣金计价货币 (可能是 TWD/HKD 等), 供持仓面板折算成 USD 显示
+        self._comm_ccy_by_execid[commissionReport.execId] = (
+            getattr(commissionReport, "currency", "") or ""
+        )
         self._emit_computed_daily()
 
     # ── 自算今日盈亏 helpers ───────────────────────────────────────────
@@ -648,6 +807,7 @@ class IBKRApp(EWrapper, EClient):
             self._exec_cf.clear()
             self._posval.clear()
             self._comm_by_execid.clear()
+            self._comm_ccy_by_execid.clear()
             self._exec_conid.clear()
             self._trade_stats.reset()   # 交易统计也按日重置 (笔数/胜率/盈亏比)
 
@@ -677,11 +837,21 @@ class IBKRApp(EWrapper, EClient):
         # 账户组的某一行覆盖成 reqPnL 不接受的代码 → 321)。
         if not self._account_name:
             self._account_name = account
+        # 账户基础货币: NetLiquidation 这行带的 currency 就是它。
+        # to_usd_rate 要靠它把 ledger 的"→基础货币"汇率换算成"→USD"。
+        if tag == "NetLiquidation" and currency and currency != "BASE":
+            self._base_currency = currency
         # Ledger request → per-currency cash balances (separate subscription)
         if reqId == self._ledger_req_id:
             if tag == "CashBalance" and currency and currency != "BASE":
                 try:
                     self.bridge.currency_balance_updated.emit(currency, float(value))
+                except (ValueError, TypeError):
+                    pass
+            elif tag == "ExchangeRate" and currency and currency != "BASE":
+                # 该货币 → 基础货币(USD) 汇率, 供持仓面板折算非美元标的
+                try:
+                    self._fx_rates[currency] = float(value)
                 except (ValueError, TypeError):
                     pass
             return
@@ -725,7 +895,7 @@ class IBKRApp(EWrapper, EClient):
 
     def pnl(self, reqId, dailyPnL, unrealizedPnL, realizedPnL):
         # IBKR 对尚未算出的字段推 DBL_MAX (~1.8e308) → 转 NaN, GUI 保留上一次的好值。
-        # 实测本账户 dailyPnL 常年 DBL_MAX(不可用), 但 unrealized/realized 有效 →
+        # 某些账户的 dailyPnL 会长期为 DBL_MAX(不可用), 但 unrealized/realized 有效 →
         # GUI 用 realized+unrealized 兜底算今日盈亏 (见 account_bar.update_daily_pnl)。
         def _clean(v):
             v = float(v)
@@ -796,8 +966,7 @@ class IBKRApp(EWrapper, EClient):
         key = self._tick_req_to_key.get(reqId)
         if key is None:
             return
-        self._last_tick_time = time.time()
-        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+        d = self._touch_tick(key, reqId)
         d["bid"] = float(bidPrice)
         d["ask"] = float(askPrice)
         d["bid_size"] = int(bidSize)
@@ -809,8 +978,7 @@ class IBKRApp(EWrapper, EClient):
         key = self._tick_req_to_key.get(reqId)
         if key is None:
             return
-        self._last_tick_time = time.time()
-        d = self._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
+        d = self._touch_tick(key, reqId)
         d["last"] = float(price)
         # GUI polls via get_tick(); no cross-thread emit needed (see tickPrice).
 
@@ -828,6 +996,9 @@ class IBKREngine:
         self._thread: threading.Thread | None = None
         self._connected = False
         self._con_id_cache: dict[str, int] = {}
+        # 期权链缓存: SYM -> (交易日 YYYYMMDD, expirations, strikes)。
+        # 见 request_option_chain —— 省掉来回切标的时每次 10 秒的 reqSecDefOptParams。
+        self._chain_cache: dict[str, tuple] = {}
         # Per-expiry option trading class, learned from request_option_chain.
         # Key "SYMBOL|EXPIRY" -> tradingClass (e.g. "SPX" vs "SPXW").
         # Index options (SPX/XSP/...) are ambiguous without it: reqMktData
@@ -868,6 +1039,12 @@ class IBKREngine:
         # Heartbeat timer (checks reader thread + tick timeout)
         self._heartbeat_timer: QTimer | None = None
         self._tick_timeout_warned = False
+
+        # 心跳定时器必须在 GUI 线程启动 (QTimer 线程约束): connect() 跑在后台
+        # 线程, 原先在那里直接建 QTimer → 定时器从未真正运行 (reader 线程死亡/
+        # 行情超时监控实际失效), 且每次连接报 QObject::startTimer 警告。
+        # 改为 bridge.connected 信号驱动 → 槽在 GUI 线程执行。
+        self.bridge.connected.connect(self._start_heartbeat)
 
         # Connect internal signals
         self.bridge.order_status_changed.connect(self._on_order_status)
@@ -942,6 +1119,64 @@ class IBKREngine:
             )
         except RuntimeError:
             return 0.0
+
+    def get_fx_rate(self, currency: str) -> float:
+        """货币 → USD 汇率。USD 恒 1.0; 汇率未到时返回 0.0 (未知)。
+
+        持仓面板用它把非美元标的的市值/盈亏/价格折算成 USD。
+        """
+        return self.to_usd_rate(currency)
+
+    def to_usd_rate(self, currency: str) -> float:
+        """把 `currency` 计价的金额换成 USD 要乘的系数; 拿不到汇率返回 0.0。
+
+        `$LEDGER:ALL` 的 ExchangeRate 是「该币 → **账户基础货币**」, **不是**
+        「该币 → USD」。因此非 USD 基础货币账户不能直接把 ExchangeRate 当作
+        →USD 汇率使用。
+
+        两边同时除以 USD 那条汇率, 基础货币就被约掉, 与基础货币是什么无关:
+
+            currency→USD = (currency→base) / (USD→base)
+        """
+        if not currency or currency == "USD":
+            return 1.0
+        if not self._app:
+            return 0.0
+        try:
+            rates = self._app._fx_rates
+            usd_to_base = rates.get("USD", 0.0)
+            if not usd_to_base:
+                return 0.0   # ledger 还没到, 老实说不知道, 别瞎折
+            if currency == getattr(self._app, "_base_currency", ""):
+                cur_to_base = 1.0
+            else:
+                cur_to_base = rates.get(currency, 0.0)
+            if not cur_to_base:
+                return 0.0
+            return cur_to_base / usd_to_base
+        except (AttributeError, RuntimeError, ZeroDivisionError):
+            return 0.0
+
+    def get_position_commission_currency(self, option_key: str) -> str:
+        """该合约今日佣金的计价货币 (如 "USD"/"TWD")。混合或未知时返回 ""。
+
+        持仓面板据此判断「费$X」里的 X 是否需要按持仓汇率折成 USD ——
+        台股佣金按 TWD 计, 不折算会把 40 TWD 显示成 $40。
+        """
+        pp = self._ibkr_positions.get(option_key)
+        if not pp or not self._app or not pp.con_id:
+            return ""
+        app = self._app
+        try:
+            ccys = {
+                app._comm_ccy_by_execid.get(eid, "")
+                for eid, cid in list(app._exec_conid.items())
+                if cid == pp.con_id
+            }
+            ccys.discard("")
+            return next(iter(ccys)) if len(ccys) == 1 else ""
+        except RuntimeError:
+            return ""
 
     @property
     def orders(self) -> dict[int, OrderInfo]:
@@ -1050,8 +1285,8 @@ class IBKREngine:
         except Exception:
             pass
 
-        # Start heartbeat monitoring
-        self._start_heartbeat()
+        # 心跳监控由 bridge.connected 信号在 GUI 线程启动 (本方法在后台线程跑,
+        # 不能直接建/启 QTimer)
 
         return True
 
@@ -1080,10 +1315,17 @@ class IBKREngine:
         self._heartbeat_timer.start(10_000)
 
     def _stop_heartbeat(self):
-        """Stop the heartbeat timer."""
-        if self._heartbeat_timer is not None:
-            self._heartbeat_timer.stop()
-            self._heartbeat_timer = None
+        """Stop the heartbeat timer (可从任意线程调用)。"""
+        timer = self._heartbeat_timer
+        self._heartbeat_timer = None
+        if timer is None:
+            return
+        if QThread.currentThread() is timer.thread():
+            timer.stop()
+        else:
+            # QTimer 不能跨线程 stop (killTimer 警告且无效) → 队列到其所属线程
+            QMetaObject.invokeMethod(timer, "stop", Qt.QueuedConnection)
+        timer.deleteLater()
 
     def _on_heartbeat(self):
         """Periodic check: reader thread alive? tick data still flowing?"""
@@ -1187,9 +1429,26 @@ class IBKREngine:
 
     # ── Option Chain Discovery ────────────────────────────────────────
 
-    def request_option_chain(self, symbol: str) -> tuple[list[str], list[float]]:
+    def request_option_chain(self, symbol: str,
+                             force: bool = False) -> tuple[list[str], list[float]]:
         """Get expirations and strikes for a symbol (blocking).
-        Returns (expirations, strikes)."""
+        Returns (expirations, strikes).
+
+        **按标的+交易日缓存**: 到期日/行权价一天之内基本不变, 但原来每次切标的都要
+        重跑一遍 reqSecDefOptParams (最长阻塞 10 秒)。实测 2026-08-11 单日日志里
+        AAPL 拉了 10 次、TSLA 11 次 —— 来回切标的时那几秒等待全是白等。
+        缓存按日失效 (跨日到期日会滚), `force=True` 可手动刷新。
+
+        注: 命中缓存时 `_opt_strikes_by_expiry` / `_opt_trading_class` 这两张
+        按到期日的表已经是上次填好的 (它们本来就跨调用常驻), 直接返回不会丢东西。
+        """
+        sym_key = symbol.upper()
+        today = datetime.now().strftime("%Y%m%d")
+        if not force:
+            hit = self._chain_cache.get(sym_key)
+            if hit and hit[0] == today:
+                return hit[1], hit[2]
+
         con_id = self.get_con_id(symbol)
 
         req_id = self._app.next_req_id()
@@ -1250,6 +1509,7 @@ class IBKREngine:
 
         expirations = sorted(all_expirations)
         strikes = sorted(all_strikes)
+        self._chain_cache[sym_key] = (today, expirations, strikes)
         return expirations, strikes
 
     def option_strikes_for_expiry(self, symbol: str, expiry: str) -> list:
@@ -1390,11 +1650,50 @@ class IBKREngine:
         self._app.reqMktData(req_id, contract, "", False, False, [])
         return req_id
 
+    def subscribe_watch_tick(self, symbol: str) -> int:
+        """订阅任意**监控标的**的行情, 数据统一落 `__stock__<SYM>` 键。
+
+        - 股票/ETF/指数 (SPX/NDX 等走 IND): 直接 subscribe_stock_tick;
+        - 期货根代码 (ES/NQ 等在 FUTURES_SPECS 中): 立即占用 reqId 返回,
+          后台线程解析近月合约后再真正 reqMktData (解析是阻塞的
+          reqContractDetails, 不能卡 GUI 线程)。首个 tick 到达前 get_tick
+          返回 0, 调用方 (条件单巡检/播种) 对 0 价均已跳过。
+        """
+        sym = symbol.upper()
+        if sym not in FUTURES_SPECS:
+            return self.subscribe_stock_tick(sym)
+        req_id = self._app.next_req_id()
+        key = f"__stock__{sym}"
+        self._app._tick_req_to_key[req_id] = key
+        self._app._active_mkt_data_reqs.add(req_id)
+
+        def _sub():
+            try:
+                cons = self.resolve_futures_contracts(sym, max_count=1)
+                if not cons:
+                    print(f"[WATCH-SUB] {sym} 无可用期货合约", flush=True)
+                    return
+                c = self._make_futures_contract(sym, cons[0]["expiry"])
+                # 解析期间已被退订则放弃
+                if req_id not in self._app._active_mkt_data_reqs:
+                    return
+                self._app._tick_req_contract[req_id] = (c, "")
+                self._app.reqMktData(req_id, c, "", False, False, [])
+            except Exception as e:
+                print(f"[WATCH-SUB] {sym} 期货行情订阅失败: {e}", flush=True)
+
+        threading.Thread(target=_sub, daemon=True,
+                         name=f"watch-sub-{sym}").start()
+        return req_id
+
     def unsubscribe_tick(self, req_id: int):
         """Cancel a tick data subscription."""
         key = self._app._tick_req_to_key.pop(req_id, None)
         self._app._tick_req_contract.pop(req_id, None)
+        self._app._tick_req_last.pop(req_id, None)
         self._app._active_mkt_data_reqs.discard(req_id)
+        if key is not None:
+            self._app._tick_retry.pop(key, None)
         try:
             self._app.cancelMktData(req_id)
         except Exception:
@@ -1405,6 +1704,35 @@ class IBKREngine:
         if self._app:
             return self._app._tick_data.get(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
         return {"bid": 0.0, "ask": 0.0, "last": 0.0}
+
+    def tick_age(self, key: str) -> float:
+        """该**合约**最近一次 tick 距今秒数 (谁推的都算); 从无数据返回 inf。"""
+        if not self._app:
+            return float("inf")
+        t = self._app._tick_data.get(key, {}).get("t", 0.0)
+        return float("inf") if not t else max(0.0, time.time() - t)
+
+    def req_tick_age(self, req_id: int) -> float:
+        """该**行情线**最近一次 tick 距今秒数; 从无数据返回 inf。
+
+        判断"我订的这条线是不是死了"必须用它, 而不是 tick_age(key): 期权链的
+        一次性快照写的是同一个 key, 会把合约级时间戳一直刷新, 掩盖掉常驻订阅
+        早已被拒/被掐的事实。
+        """
+        if not self._app or req_id is None:
+            return float("inf")
+        t = self._app._tick_req_last.get(req_id, 0.0)
+        return float("inf") if not t else max(0.0, time.time() - t)
+
+    def market_data_age(self) -> float:
+        """**任意**合约最近一次 tick 距今秒数。
+
+        与 `tick_age(key)` 对比即可区分两种"不动": 全局也不动 = 整体断流/收盘
+        (交给心跳和重连处理); 全局在动而某个 key 不动 = 那条行情线死了, 该重订。
+        """
+        if not self._app or not self._app._last_tick_time:
+            return float("inf")
+        return max(0.0, time.time() - self._app._last_tick_time)
 
     def get_trade_stats(self) -> dict:
         """已平仓交易统计快照 (笔数/胜率/盈亏比)。未连接返回空统计。"""
@@ -1581,6 +1909,19 @@ class IBKREngine:
         self._app._account_summary_req_id = req_id
         tags = "NetLiquidation,TotalCashValue,BuyingPower,UnrealizedPnL,RealizedPnL"
         self._app.reqAccountSummary(req_id, "All", tags)
+
+    def resync_account_summary(self):
+        """强制 IBKR **立刻**回一份账户摘要快照 (cancel + 重订)。
+
+        `reqAccountSummary` 订上之后 IBKR 只在值变化或约每 3 分钟才推 —— 总资产/
+        可用资金/购买力于是长时间纹丝不动。重订会立即触发一次全量推送。
+        由 account_bar 按 ACCOUNT_RESYNC_MS 调用 (30 秒一次, 不是每 3 秒, 避免
+        当年那种 EMsgPacer / NonAwtClientQueue 堆积)。
+        """
+        if not self._app or not self._connected:
+            return
+        self.cancel_account_summary()
+        self.request_account_summary()
 
     def cancel_account_summary(self):
         """Cancel account summary subscription."""
@@ -2043,8 +2384,21 @@ class IBKREngine:
               f"{option.display_name} @ {price:.2f} status={status_str}",
               flush=True)
 
-    # Order-event warnings (399/2109) — order may still be working, not a reject
-    ORDER_WARN_CODES = {399, 2109}
+    # Order-event warnings — 订单还活着, 不是拒单
+    ORDER_WARN_CODES = {399}
+
+    @classmethod
+    def _is_order_warning(cls, code: int) -> bool:
+        """IBKR 把 2100-2200 整段划为 System/Warning messages —— 订单没被拒。
+
+        真正的拒单在 100-4xx (201 rejected / 202 cancelled / 203 / 321...) 和 10xxx。
+        原来只白名单了 2109, 漏了 **2161**(监管限价封顶提示): 2026-08-10 那张
+        IBM C320/C325 组合单因此被标成「已拒绝」、弹了拒单框、写进拒单日志 ——
+        而它其实好好地**成交了** (紧接着 status=Filled avgFill=0.01)。
+        用户看到的"组合单交易不了", 有一半是这个假拒单造成的。
+        整段放行, 免得下次又漏一个 21xx。
+        """
+        return code in cls.ORDER_WARN_CODES or 2100 <= code < 2200
 
     def _on_order_error(self, req_id: int, code: int, msg: str):
         """Detect IBKR order rejections and surface the reason prominently.
@@ -2057,7 +2411,7 @@ class IBKREngine:
         order = self._orders.get(req_id)
         if order is None:
             return
-        if code in self.ORDER_WARN_CODES:
+        if self._is_order_warning(code):
             return  # warning only — status bar already shows it
         if code == 202 and req_id in self._user_cancel_ids:
             self._user_cancel_ids.discard(req_id)
@@ -2349,7 +2703,9 @@ class IBKREngine:
     def place_combo_order(self, symbol: str, legs: list,
                           action: str, quantity: int,
                           limit_price: float,
-                          outside_rth: bool = False) -> int:
+                          outside_rth: bool = False,
+                          market: bool = False,
+                          non_guaranteed: bool = False) -> int:
         """Place a BAG (combo) order for a multi-leg strategy.
 
         Args:
@@ -2357,8 +2713,9 @@ class IBKREngine:
             legs: List of ComboLegInfo objects (con_id must be resolved)
             action: "BUY" or "SELL"
             quantity: Number of combo units
-            limit_price: Net limit price for the combo
+            limit_price: Net limit price for the combo (market=True 时忽略)
             outside_rth: Allow execution outside regular trading hours
+            market: True = 市价组合单 (一键平仓用)
 
         Returns:
             orderId
@@ -2390,16 +2747,23 @@ class IBKREngine:
         # Build order
         order = Order()
         order.action = action
-        order.orderType = "LMT"
+        order.orderType = "MKT" if market else "LMT"
         order.totalQuantity = quantity
-        order.lmtPrice = limit_price
+        order.lmtPrice = 0.0 if market else limit_price
         order.eTradeOnly = False
         order.firmQuoteOnly = False
         order.tif = "DAY"
         order.outsideRth = outside_rth
-        order.smartComboRoutingParams = [
-            TagValue("NonGuaranteed", "1"),
-        ]
+        # NonGuaranteed=1 = 允许 SMART 把各腿**拆开分别成交**。代价是 IBKR 会按
+        # "每条腿各自独立"算保证金 —— 卖出的那条腿被当成**裸卖**, 于是价差单被
+        # 按裸空的保证金拒掉 (实测: SPX 7045/7050 价差报
+        # "GROSS POSITION VALUE [121184.60] MUST NOT EXCEED NLV [1219.18] × 30",
+        # IBM C320/C325 那次则是 "UNCOVERED OPTION POSITION")。
+        # TWS 原生组合单默认是**保证成交(guaranteed)**, 按价差整体算保证金, 所以
+        # 同一个价差在 TWS 能下、在这里下不了。默认改回 guaranteed, 需要拆腿时
+        # 由界面上的勾选显式打开。
+        if non_guaranteed:
+            order.smartComboRoutingParams = [TagValue("NonGuaranteed", "1")]
 
         order_id = self._app.next_order_id()
 
@@ -2421,8 +2785,8 @@ class IBKREngine:
             option=option,
             action=OrderAction.BUY if action == "BUY" else OrderAction.SELL,
             quantity=quantity,
-            limit_price=limit_price,
-            order_type=OrderType.LIMIT,
+            limit_price=0.0 if market else limit_price,
+            order_type=OrderType.MARKET if market else OrderType.LIMIT,
             commission=commission,
         )
         self._orders[order_id] = order_info
@@ -2430,8 +2794,9 @@ class IBKREngine:
         leg_desc = " + ".join(
             f"{l.action} {l.ratio}x {l.right}{l.strike}" for l in legs
         )
+        price_desc = "MKT" if market else f"@ {limit_price:.2f}"
         print(f"[COMBO ORDER] {action} {quantity}x {symbol} "
-              f"[{leg_desc}] @ {limit_price:.2f} "
+              f"[{leg_desc}] {price_desc} "
               f"outsideRth={outside_rth} orderId={order_id}", flush=True)
 
         self._app.placeOrder(order_id, contract, order)

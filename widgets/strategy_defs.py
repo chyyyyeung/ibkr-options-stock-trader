@@ -58,12 +58,13 @@ STRATEGY_REGISTRY: dict[StrategyType, StrategyTemplate] = {
         is_debit=True,
     ),
 
+    # 约定: strike1 = 低行权价, strike2 = 高行权价 (UI 标签「低/高行权价」按此填)
     StrategyType.BEAR_PUT_SPREAD: StrategyTemplate(
         strategy_type=StrategyType.BEAR_PUT_SPREAD,
         display_name="Bear Put Spread (熊市看跌价差)",
         legs=[
-            LegTemplate("strike1", "P", "BUY"),
-            LegTemplate("strike2", "P", "SELL"),
+            LegTemplate("strike2", "P", "BUY"),    # 买高行权价 Put
+            LegTemplate("strike1", "P", "SELL"),   # 卖低行权价 Put
         ],
         strike_params=["strike1", "strike2"],
         description="买高行权价Put, 卖低行权价Put. 看跌, 有限风险/收益.",
@@ -86,8 +87,8 @@ STRATEGY_REGISTRY: dict[StrategyType, StrategyTemplate] = {
         strategy_type=StrategyType.BULL_PUT_SPREAD,
         display_name="Bull Put Spread (牛市看跌信用价差)",
         legs=[
-            LegTemplate("strike1", "P", "SELL"),
-            LegTemplate("strike2", "P", "BUY"),
+            LegTemplate("strike2", "P", "SELL"),   # 卖高行权价 Put
+            LegTemplate("strike1", "P", "BUY"),    # 买低行权价 Put
         ],
         strike_params=["strike1", "strike2"],
         description="卖高行权价Put, 买低行权价Put. 看涨, 收取权利金.",

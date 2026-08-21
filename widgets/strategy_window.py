@@ -5,6 +5,9 @@ main window (independent of the single-leg price ladder). `StrategyWindow` is a
 thin QMainWindow wrapper kept for standalone / backward-compatible use.
 """
 
+import os
+import json
+import time
 import threading
 
 from PyQt5.QtWidgets import (
@@ -20,12 +23,14 @@ from config import (
     COLOR_BG, COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT,
     COLOR_BORDER, COLOR_ACCENT, COLOR_GREEN, COLOR_RED,
     COLOR_BUY, COLOR_SELL, COMMISSION_PER_CONTRACT, COMMISSION_MIN,
+    COLOR_TEXT_DIM, COLOR_BUTTON_DISABLED, COLOR_ACCENT_HOVER,
 )
 from models import OptionInfo, ComboLegInfo
 
 from widgets.strategy_defs import (
     StrategyType, LegTemplate, StrategyTemplate, STRATEGY_REGISTRY,
 )
+from widgets.ui_util import disable_ime
 
 
 WINDOW_STYLESHEET = f"""
@@ -104,8 +109,22 @@ class StrategyPanel(QWidget):
         self._refresh_timer: QTimer | None = None
         self._loaded = False  # 是否已加载期权链 (懒加载: 首次进入该 Tab 才拉)
 
+        # 已开组合记录 (供一键平仓): 持久化 strategy_combos.json (gitignore)
+        self._open_combos: list[dict] = []
+        self._combos_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "strategy_combos.json")
+
         self._build_ui()
+        disable_ime(self)   # 见 ui_util: 别让搜狗挂上来
         self.setStyleSheet(WINDOW_STYLESHEET)
+        self._load_combos()
+        self._render_combos()
+
+        # 跟踪组合订单状态: 成交 → 标「持仓中」; 撤单/拒单 → 移除记录
+        bridge = getattr(engine, "bridge", None)
+        if bridge is not None:
+            bridge.order_status_changed.connect(self._on_combo_order_status)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -134,7 +153,7 @@ class StrategyPanel(QWidget):
 
         # Description
         self._desc_label = QLabel("")
-        self._desc_label.setStyleSheet(f"color: #aaaaaa; font-size: 11px;")
+        self._desc_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
         self._desc_label.setWordWrap(True)
         layout.addWidget(self._desc_label)
 
@@ -228,6 +247,18 @@ class StrategyPanel(QWidget):
         self._limit_spin.setFixedWidth(90)
         order_layout.addWidget(self._limit_spin)
 
+        # 默认**不**勾: 保证成交 (guaranteed) = TWS 原生组合单的默认行为, IBKR 按
+        # 价差整体算保证金。勾上则允许 SMART 拆腿分别成交, 但保证金按每条腿独立算
+        # (卖腿当裸空), 小账户的价差单会被直接拒掉。详见 engine.place_combo_order。
+        self._non_guar_cb = QCheckBox("允许拆腿成交")
+        self._non_guar_cb.setChecked(False)
+        self._non_guar_cb.setToolTip(
+            "不勾 (默认): 保证成交 —— 多腿必须一起成交, IBKR 按价差整体算保证金。\n"
+            "勾上: 允许 SMART 把各腿拆开分别成交, 可能只成交一条腿 (裸腿风险),\n"
+            "且保证金按每条腿独立计算 —— 小账户的价差单常被拒 (UNCOVERED / 保证金不足)。"
+        )
+        order_layout.addWidget(self._non_guar_cb)
+
         order_layout.addSpacing(10)
         self._outside_rth_cb = QCheckBox("盘外交易")
         order_layout.addWidget(self._outside_rth_cb)
@@ -239,8 +270,9 @@ class StrategyPanel(QWidget):
         self._place_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_ACCENT}; color: {COLOR_BG}; "
             f"font-weight: bold; font-size: 13px; border-radius: 4px; }}"
-            f"QPushButton:hover {{ background-color: #00e5ff; }}"
-            f"QPushButton:disabled {{ background-color: #404040; color: #888; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_ACCENT_HOVER}; }}"
+            f"QPushButton:disabled {{ background-color: {COLOR_BUTTON_DISABLED}; "
+            f"color: {COLOR_TEXT_DIM}; }}"
         )
         self._place_btn.clicked.connect(self._on_place_order)
         order_layout.addWidget(self._place_btn)
@@ -249,8 +281,15 @@ class StrategyPanel(QWidget):
 
         # Status
         self._status_label = QLabel("请等待期权链加载...")
-        self._status_label.setStyleSheet(f"color: #aaaaaa; font-size: 11px;")
+        self._status_label.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
         layout.addWidget(self._status_label)
+
+        # ── Row 6: 已开组合 (一键平仓) ──
+        self._combos_group = QGroupBox("已开组合 (一键平仓)")
+        self._combos_layout = QVBoxLayout()
+        self._combos_group.setLayout(self._combos_layout)
+        self._combos_group.setVisible(False)
+        layout.addWidget(self._combos_group)
 
     # ── Public Interface ──────────────────────────────────────────────
 
@@ -748,6 +787,9 @@ class StrategyPanel(QWidget):
         self._place_btn.setText("解析合约中...")
         self._status_label.setText("正在解析合约ID...")
 
+        outside = self._outside_rth_cb.isChecked()
+        non_guar = self._non_guar_cb.isChecked()
+
         def do_resolve_and_place():
             try:
                 # Resolve conId for each leg
@@ -760,17 +802,29 @@ class StrategyPanel(QWidget):
                 # Place the combo order
                 order_id = self._engine.place_combo_order(
                     self._symbol, self._legs, action, qty,
-                    limit_price, self._outside_rth_cb.isChecked(),
+                    limit_price, outside, non_guaranteed=non_guar,
                 )
 
-                QTimer.singleShot(0, lambda: self._on_order_placed(order_id))
+                # 记录快照 (con_id 已解析), 供「一键平仓」反向 BAG 单用
+                record = {
+                    "order_id": order_id, "status": "已提交",
+                    "name": name, "symbol": self._symbol,
+                    "action": action, "qty": qty, "outside": outside,
+                    "time": time.strftime("%m-%d %H:%M"),
+                    "legs": [{"con_id": l.con_id, "symbol": l.symbol,
+                              "expiry": l.expiry, "strike": l.strike,
+                              "right": l.right, "action": l.action,
+                              "ratio": l.ratio} for l in self._legs],
+                }
+                QTimer.singleShot(
+                    0, lambda: self._on_order_placed(order_id, record))
 
             except Exception as e:
                 QTimer.singleShot(0, lambda: self._on_order_error(str(e)))
 
         threading.Thread(target=do_resolve_and_place, daemon=True).start()
 
-    def _on_order_placed(self, order_id: int):
+    def _on_order_placed(self, order_id: int, record: dict = None):
         """Order placed successfully."""
         self._place_btn.setEnabled(True)
         self._place_btn.setText("下单组合")
@@ -779,6 +833,10 @@ class StrategyPanel(QWidget):
             self._status_label.setStyleSheet(
                 f"color: {COLOR_GREEN}; font-size: 11px;"
             )
+            if record is not None:
+                self._open_combos.append(record)
+                self._save_combos()
+                self._render_combos()
         else:
             self._status_label.setText("下单失败")
             self._status_label.setStyleSheet(
@@ -794,6 +852,126 @@ class StrategyPanel(QWidget):
             f"color: {COLOR_RED}; font-size: 11px;"
         )
         QMessageBox.critical(self, "下单失败", error)
+
+    # ── 已开组合 (一键平仓) ───────────────────────────────────────────
+
+    def _on_combo_order_status(self, order_id: int, status: str,
+                               filled: float, remaining: float, avg: float):
+        """跟踪组合订单: 成交 → 标「持仓中」; 开仓单被撤/拒 → 移除记录。"""
+        changed = False
+        for rec in list(self._open_combos):
+            if rec["order_id"] != order_id:
+                continue
+            if status == "Filled" and rec["status"] != "持仓中":
+                rec["status"] = "持仓中"
+                changed = True
+            elif (status in ("Cancelled", "ApiCancelled", "Inactive")
+                  and rec["status"] == "已提交"):
+                self._open_combos.remove(rec)   # 未成交即被撤/拒 → 无仓可平
+                changed = True
+        if changed:
+            self._save_combos()
+            self._render_combos()
+
+    def _render_combos(self):
+        while self._combos_layout.count():
+            item = self._combos_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._combos_group.setVisible(bool(self._open_combos))
+        for rec in self._open_combos:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            legs_s = " + ".join(
+                f"{l['action'][0]}{l['ratio']}x{l['right']}{l['strike']:g}"
+                for l in rec["legs"])
+            col = COLOR_GREEN if rec["status"] == "持仓中" else COLOR_TEXT_DIM
+            lbl = QLabel(f"[{rec['status']}] {rec['time']} {rec['symbol']} "
+                         f"{rec['name']} {rec['action']}×{rec['qty']}: {legs_s}")
+            lbl.setStyleSheet(f"color: {col}; font-size: 11px;")
+            lbl.setToolTip("B=BUY / S=SELL, 比例x类型行权价")
+            h.addWidget(lbl, stretch=1)
+            btn = QPushButton("一键平仓")
+            btn.setFixedHeight(24)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip("反向市价 BAG 单整体平掉该组合 (多腿一张单同时成交)")
+            btn.clicked.connect(lambda _c, r=rec: self._on_close_combo(r))
+            h.addWidget(btn)
+            rm = QPushButton("✕")
+            rm.setFixedSize(24, 24)
+            rm.setToolTip("仅删除本条记录 (不下单)")
+            rm.clicked.connect(lambda _c, r=rec: self._on_remove_combo_record(r))
+            h.addWidget(rm)
+            self._combos_layout.addWidget(row)
+
+    def _on_close_combo(self, rec: dict):
+        """一键平仓: 用**反向市价 BAG 单**把该组合整体平掉 (多腿一张单)。"""
+        if not hasattr(self._engine, "place_combo_order"):
+            QMessageBox.warning(self, "不支持", "当前引擎不支持组合单平仓")
+            return
+        rev = "SELL" if rec["action"] == "BUY" else "BUY"
+        legs_desc = "\n".join(
+            f"  {l['action']} {l['ratio']}x {l['right']} {l['strike']:g} "
+            f"({l['expiry']})" for l in rec["legs"])
+        ret = QMessageBox.question(
+            self, "一键平仓 (市价)",
+            f"{rec['name']} — {rec['action']} {rec['qty']} 组\n{legs_desc}\n\n"
+            f"将以反向 {rev} **市价** BAG 组合单整体平仓\n"
+            f"(多腿视为一个整体, 一张单同时成交)。确定?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        legs = [ComboLegInfo(
+                    con_id=l["con_id"], symbol=l["symbol"], expiry=l["expiry"],
+                    strike=l["strike"], right=l["right"], action=l["action"],
+                    ratio=l.get("ratio", 1))
+                for l in rec["legs"]]
+        order_id = self._engine.place_combo_order(
+            rec["symbol"], legs, rev, rec["qty"], 0.0,
+            rec.get("outside", False), market=True)
+        if order_id and order_id > 0:
+            self._open_combos.remove(rec)
+            self._save_combos()
+            self._render_combos()
+            self._status_label.setText(
+                f"平仓单已提交 orderId={order_id} (反向 {rev} 市价组合单)")
+            self._status_label.setStyleSheet(
+                f"color: {COLOR_GREEN}; font-size: 11px;")
+
+    def _on_remove_combo_record(self, rec: dict):
+        if rec in self._open_combos:
+            self._open_combos.remove(rec)
+            self._save_combos()
+            self._render_combos()
+
+    def _save_combos(self):
+        try:
+            with open(self._combos_path, "w", encoding="utf-8") as f:
+                json.dump(self._open_combos, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[COMBO] save error: {e}", flush=True)
+
+    def _load_combos(self):
+        if not os.path.exists(self._combos_path):
+            return
+        try:
+            with open(self._combos_path, "r", encoding="utf-8") as f:
+                self._open_combos = json.load(f)
+        except Exception as e:
+            print(f"[COMBO] load error: {e}", flush=True)
+            self._open_combos = []
+        # 清理过期组合 (所有腿都已到期的记录无仓可平)
+        today = time.strftime("%Y%m%d")
+        before = len(self._open_combos)
+        self._open_combos = [
+            rec for rec in self._open_combos
+            if any(str(l.get("expiry", "")) >= today for l in rec.get("legs", []))
+        ]
+        if len(self._open_combos) != before:
+            self._save_combos()
 
 
 class StrategyWindow(QMainWindow):

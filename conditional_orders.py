@@ -60,7 +60,7 @@ class ConditionalOrderManager(QObject):
 
         self._timer = QTimer()
         self._timer.timeout.connect(self._check)
-        self._timer.start(500)
+        self._timer.start(200)   # 巡检间隔 (用户要求 0.2s, 2026-07-10)
 
     # ── 依赖注入 ──────────────────────────────────────────────────────
     def configure(self, get_tick, place, subscribe, unsubscribe, subscribe_under=None,
@@ -87,19 +87,22 @@ class ConditionalOrderManager(QObject):
     def arm(self, option: OptionInfo, kind: str, trigger_price: float,
             limit_price: float, quantity: int, outside_rth: bool,
             watch: str = "SELF", direction: str = "",
-            market: bool = False) -> ConditionalOrder:
+            market: bool = False, watch_symbol: str = "") -> ConditionalOrder:
         """新增一个本地条件单并开始监控。
 
         kind: 'TP'(止盈)/'SL'(止损)/'UL'(标的价触发)。
         watch: 'SELF'(监控期权自身价) / 'UNDER'(监控标的价)。
         direction: 'UP'(>=) / 'DOWN'(<=); 空则按 kind 推导。
         market: True=触发后发市价单 (忽略 limit_price)。
+        watch_symbol: watch='UNDER' 时监控的标的代码 ("" = 期权自己的标的;
+                      可指定其它, 如 SPY 期权盯 SPX/ES)。
         """
         cond = ConditionalOrder(
             cond_id=self._next_id, option=option, kind=kind, action="SELL",
             trigger_price=float(trigger_price), limit_price=float(limit_price),
             quantity=int(quantity), native=False, outside_rth=bool(outside_rth),
             watch=watch, direction=direction, market=bool(market),
+            watch_symbol=(watch_symbol or "").upper(),
         )
         self._next_id += 1
         # 去重: 同合约+同类型+同监控对象+同方向+同触发价的旧条件单 → 用新单替换
@@ -107,6 +110,7 @@ class ConditionalOrderManager(QObject):
         for old in [c for c in self._conds.values()
                     if c.key == cond.key and c.kind == cond.kind
                     and c.watch == cond.watch
+                    and c.watch_symbol == cond.watch_symbol
                     and c._trigger_dir() == cond._trigger_dir()
                     and abs(c.trigger_price - cond.trigger_price) < 1e-9]:
             self._conds.pop(old.cond_id, None)
@@ -230,9 +234,10 @@ class ConditionalOrderManager(QObject):
         if cond.cond_id in self._req_ids:
             return
         try:
-            # 标的触发看标的行情, 否则看期权自身行情
+            # 标的触发看标的行情 (默认期权自己的标的, 可指定其它), 否则看期权自身
             if cond.watch == "UNDER":
-                req_id = self._subscribe_under(cond.option.symbol)
+                req_id = self._subscribe_under(
+                    cond.watch_symbol or cond.option.symbol)
             else:
                 req_id = self._subscribe(cond.option)
             if req_id is not None:

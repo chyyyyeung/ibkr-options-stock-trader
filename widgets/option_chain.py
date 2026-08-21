@@ -8,7 +8,7 @@ from momentum_flip import analyze as analyze_es_momentum
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QLabel,
-    QPushButton, QButtonGroup,
+    QPushButton, QButtonGroup, QSizePolicy,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QBrush
@@ -16,7 +16,7 @@ from PyQt5.QtGui import QColor, QBrush
 from config import (
     COLOR_BG_PANEL, COLOR_BG_DARK, COLOR_TEXT, COLOR_TEXT_DIM,
     COLOR_ATM_HIGHLIGHT, COLOR_GREEN, COLOR_RED, COLOR_ACCENT,
-    COLOR_BORDER, COLOR_BUTTON_DISABLED,
+    COLOR_BORDER, COLOR_BUTTON_DISABLED, COLOR_ACCENT_HOVER, COLOR_MY_ORDER,
     MAX_EXPIRY_TABS_PER_RANGE, MAX_SIMULTANEOUS_STREAMS,
 )
 from models import OptionInfo
@@ -155,7 +155,7 @@ class OptionChainWidget(QWidget):
                 font-size: 12px;
                 padding: 2px 10px;
             }}
-            QPushButton:hover {{ background-color: #0097a7; }}
+            QPushButton:hover {{ background-color: {COLOR_ACCENT_HOVER}; }}
             QPushButton:disabled {{
                 background-color: {COLOR_BUTTON_DISABLED}; color: #555555;
                 border: 1px solid {COLOR_BORDER};
@@ -170,7 +170,9 @@ class OptionChainWidget(QWidget):
         # ── Tab widget ──
         self.tab_widget = QTabWidget()
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
-        layout.addWidget(self.tab_widget)
+        self.tab_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # stretch=1 → 标题与筛选栏之外的纵向空间全部给报价表
+        layout.addWidget(self.tab_widget, stretch=1)
 
     def _apply_range_btn_style(self, btn: QPushButton, selected: bool, enabled: bool):
         if not enabled:
@@ -255,7 +257,9 @@ class OptionChainWidget(QWidget):
                 f"color: {COLOR_TEXT_DIM}; font-size: 12px; padding: 0 8px;"
             )
             return
-        amber = "#ffab00"   # 震荡(chop) 用琥珀色 = 中性警示
+        # 震荡(chop) 用琥珀色 = 中性警示 (复用 COLOR_MY_ORDER 的主题琥珀,
+        # 亮色主题下自动加深保证白底可读)
+        amber = COLOR_MY_ORDER
 
         # 翻转部分 (最actionable, 加粗)
         flip = state.get("flip")
@@ -462,6 +466,25 @@ class OptionChainWidget(QWidget):
         if self._expirations:
             self._on_tab_changed(0)
 
+    def select_expiry(self, expiry: str) -> bool:
+        """跳到指定到期日的 Tab (双击持仓/监控/委托里的期权时联动)。
+
+        到期日不在当前 range 的可见 Tab 里时, 自动切到第一个包含它的 range
+        再选中; 找不到 (已过期/不属于当前标的) 返回 False, 不动当前显示。
+        """
+        if not expiry or expiry not in self._all_expirations:
+            return False
+        if expiry in self._expirations:
+            self.tab_widget.setCurrentIndex(self._expirations.index(expiry))
+            return True
+        for name in RANGE_NAMES:
+            bucket = self._range_buckets.get(name) or []
+            if expiry in bucket[:MAX_EXPIRY_TABS_PER_RANGE]:
+                self._apply_range_filter(name)
+                self.tab_widget.setCurrentIndex(self._expirations.index(expiry))
+                return True
+        return False
+
     def _format_expiry(self, exp: str) -> str:
         """Format expiry for tab display. Shows DTE."""
         today = datetime.now()
@@ -495,6 +518,12 @@ class OptionChainWidget(QWidget):
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setAlternatingRowColors(False)
+        # 表格吃满 Tab 页的空间, 且地板压得很低 → 纵向空间紧张时它自己出滚动条,
+        # 而不是把 sizeHint 顶成一个大块去挤压别的模块。
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table.setMinimumHeight(60)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         table._expiry = expiry   # 该 Tab 的到期日 (供懒填充/点击用)
         table._built = False     # 行是否已填充
 

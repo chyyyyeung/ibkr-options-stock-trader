@@ -125,6 +125,9 @@ class PaperEngine:
     def subscribe_stock_tick(self, symbol):
         return self.ibkr.subscribe_stock_tick(symbol)
 
+    def subscribe_watch_tick(self, symbol):
+        return self.ibkr.subscribe_watch_tick(symbol)
+
     def snapshot_option_tick(self, option):
         return self.ibkr.snapshot_option_tick(option)
 
@@ -133,6 +136,15 @@ class PaperEngine:
 
     def get_tick(self, key):
         return self.ibkr.get_tick(key)
+
+    def tick_age(self, key):
+        return self.ibkr.tick_age(key)
+
+    def req_tick_age(self, req_id):
+        return self.ibkr.req_tick_age(req_id)
+
+    def market_data_age(self):
+        return self.ibkr.market_data_age()
 
     def get_trade_stats(self):
         return self._trade_stats.snapshot()
@@ -184,6 +196,10 @@ class PaperEngine:
             "RealizedPnL", f"{self._realized_pnl:.2f}", "USD", "Paper"
         )
         self.bridge.account_summary_end.emit()
+
+    def resync_account_summary(self):
+        """模拟盘本来就是现算现推 → 与 request_account_summary 等价。"""
+        self.request_account_summary()
 
     def cancel_account_summary(self):
         pass  # No-op for paper
@@ -527,8 +543,14 @@ class PaperEngine:
     def place_combo_order(self, symbol: str, legs: list,
                           action: str, quantity: int,
                           limit_price: float,
-                          outside_rth: bool = False) -> int:
-        """Combo orders not supported in paper mode."""
+                          outside_rth: bool = False,
+                          market: bool = False,
+                          non_guaranteed: bool = False) -> int:
+        """Combo orders not supported in paper mode.
+
+        签名要跟 IBKREngine 保持一致 —— 面板是按关键字传 market / non_guaranteed 的,
+        少一个参数在模拟模式下会直接 TypeError 而不是那句友好提示。
+        """
         self.bridge.error_received.emit(-1, -1, "模拟模式不支持组合订单")
         return -1
 

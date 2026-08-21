@@ -205,9 +205,19 @@ class PortfolioPosition:
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     daily_pnl: float = 0.0     # Today's PnL (from reqPnLSingle)
-    has_pnl_data: bool = False  # True once reqPnLSingle data arrived
+    has_pnl_data: bool = False  # True once reqPnLSingle 有任何有效字段到达
+    # 今日盈亏是否拿到过有效值。与 has_pnl_data 分开, 因为 IBKR 的 dailyPnL 常年
+    # DBL_MAX(无效) 而市值/浮盈亏有效 —— 合用一个标志会让今日盈亏显示成误导性的 $0.00。
+    has_daily_data: bool = False
+    # unrealized_pnl 是否为本地自算 (市值 − 成本) 而非 IBKR 直接推送。
+    # 见 position_panel.on_pnl_single 里的说明。
+    pnl_is_derived: bool = False
     currency: str = "USD"
     multiplier: float = 1.0
+    # 本币 → 基础货币(USD) 汇率。USD 恒 1.0; 非美元标的由账户 ledger 的 ExchangeRate
+    # 填入 (reqPnLSingle 的市值/盈亏可能按**当地货币**返回, 需乘此汇率才是 USD)。
+    # 0.0 = 汇率未知 (ledger 未到), 显示层据此回退显示本币。
+    fx_rate: float = 1.0
 
     @property
     def display_name(self) -> str:
@@ -228,8 +238,43 @@ class PortfolioPosition:
         return f"{self.symbol}_{self.sec_type}"
 
     @property
+    def _usd_ready(self) -> bool:
+        """能否把本币数值折算成 USD (USD 标的恒真; 非美元需已拿到 ledger 汇率)。"""
+        return self.currency == "USD" or self.fx_rate > 0
+
+    @property
+    def avg_price_usd(self) -> float:
+        """每股/每份平均成本, 折算为 USD (= 本币均价 × 汇率)。汇率未知返回 0.0。"""
+        return self.avg_price * self.fx_rate if self._usd_ready else 0.0
+
+    @property
+    def market_price_usd(self) -> float:
+        """每股/每份现价, 折算为 USD (= 本币现价 × 汇率)。汇率未知返回 0.0。"""
+        return self.market_price * self.fx_rate if self._usd_ready else 0.0
+
+    @property
+    def market_value_usd(self) -> float:
+        """持仓市值, 折算为 USD (= 本币市值 × 汇率)。汇率未知返回 0.0。"""
+        return self.market_value * self.fx_rate if self._usd_ready else 0.0
+
+    @property
+    def unrealized_pnl_usd(self) -> float:
+        """未实现盈亏, 折算为 USD。汇率未知返回 0.0。"""
+        return self.unrealized_pnl * self.fx_rate if self._usd_ready else 0.0
+
+    @property
+    def daily_pnl_usd(self) -> float:
+        """今日盈亏, 折算为 USD。汇率未知返回 0.0。"""
+        return self.daily_pnl * self.fx_rate if self._usd_ready else 0.0
+
+    @property
     def pnl_pct(self) -> float:
-        cost = self.avg_price * abs(self.quantity) * self.multiplier
+        # 用「市值 − 浮盈亏」作成本基础算百分比 —— 分子分母同为**当地货币**,
+        # 汇率约掉, 百分比与币种无关 (无需先折成 USD)。
+        if self.has_pnl_data and self.market_value:
+            cost = abs(self.market_value - self.unrealized_pnl)
+        else:
+            cost = abs(self.avg_price * self.quantity * self.multiplier)
         if cost <= 0:
             return 0.0
         return self.unrealized_pnl / cost * 100
@@ -289,6 +334,9 @@ class ConditionalOrder:
     watch: str = "SELF"        # "SELF"=监控期权自身价 / "UNDER"=监控标的价
     direction: str = ""        # "UP"(>=) / "DOWN"(<="); 空则按 kind 推导
     market: bool = False       # True=触发后发市价单; False=限价单
+    # watch=="UNDER" 时监控哪个标的: "" = 期权自己的标的 (默认);
+    # 也可指定其它代码 (如 SPY 期权盯 SPX / ES 到价卖出)
+    watch_symbol: str = ""
     armed_time: datetime = field(default_factory=datetime.now)
 
     @property
@@ -298,9 +346,10 @@ class ConditionalOrder:
 
     @property
     def watch_key(self) -> str:
-        """**监控**行情用的 key: 标的触发看标的 (`__stock__SYM`), 否则看期权自身。"""
+        """**监控**行情用的 key: 标的触发看标的 (`__stock__SYM`, 可为指定的
+        其它监控标的), 否则看期权自身。"""
         if self.watch == "UNDER":
-            return f"__stock__{self.option.symbol}"
+            return f"__stock__{(self.watch_symbol or self.option.symbol).upper()}"
         return self.option.to_ibkr_key()
 
     @property
@@ -343,6 +392,7 @@ class ConditionalOrder:
             "quantity": self.quantity, "native": self.native,
             "outside_rth": self.outside_rth,
             "watch": self.watch, "direction": self.direction, "market": self.market,
+            "watch_symbol": self.watch_symbol,
         }
 
     @staticmethod
@@ -361,6 +411,7 @@ class ConditionalOrder:
             outside_rth=d.get("outside_rth", False),
             watch=d.get("watch", "SELF"), direction=d.get("direction", ""),
             market=d.get("market", False),
+            watch_symbol=d.get("watch_symbol", ""),
         )
 
 

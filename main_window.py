@@ -6,9 +6,10 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QMessageBox, QStatusBar,
-    QPushButton, QLabel, QApplication,
+    QPushButton, QLabel, QApplication, QSizePolicy, QMenu, QAction,
+    QScrollArea, QFrame,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent, QSettings
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent, QSettings, QRect
 
 from config import (
     COLOR_BG, COLOR_BG_DARK, COLOR_BG_PANEL, COLOR_TEXT,
@@ -16,6 +17,7 @@ from config import (
     SPX_SESSION_GTH_START, SPX_SESSION_GTH_END,
     SPX_SESSION_RTH_START, SPX_SESSION_RTH_END,
     DATA_CONNECTION_ERROR_CODES,
+    THEME_NAME, UI_RADIUS, save_theme_name,
 )
 from config import FUTURES_SPECS, FUTURES_MAX_EXPIRIES, FUTURES_REQUIRE_BRACKET
 from models import OptionInfo, OrderAction, OrderType, TradingMode
@@ -33,6 +35,7 @@ from widgets.account_bar import AccountBar
 from widgets.option_calculator import OptionCalculator
 from widgets.strategy_window import StrategyPanel
 from widgets.watch_panel import WatchPanel
+from widgets.ui_util import disable_ime
 # ChartWindow is imported lazily (first chart open) — it pulls in
 # numpy + pyqtgraph (~25MB), which shouldn't load at startup
 
@@ -82,14 +85,14 @@ DARK_STYLESHEET = f"""
         color: {COLOR_TEXT};
         border: 1px solid {COLOR_BORDER};
         padding: 4px 8px;
-        border-radius: 3px;
+        border-radius: {UI_RADIUS};
     }}
     QComboBox {{
         background-color: {COLOR_BG_DARK};
         color: {COLOR_TEXT};
         border: 1px solid {COLOR_BORDER};
         padding: 4px 8px;
-        border-radius: 3px;
+        border-radius: {UI_RADIUS};
     }}
     QComboBox::drop-down {{
         border: none;
@@ -104,7 +107,7 @@ DARK_STYLESHEET = f"""
         color: {COLOR_TEXT};
         border: 1px solid {COLOR_BORDER};
         padding: 4px;
-        border-radius: 3px;
+        border-radius: {UI_RADIUS};
     }}
     QLabel {{
         color: {COLOR_TEXT};
@@ -133,6 +136,41 @@ DARK_STYLESHEET = f"""
     }}
 """
 
+# 科幻主题追加规则: 选中 Tab 顶部电光青描边、输入框聚焦发光边、
+# 表头字距拉开 —— 只叠加视觉, 不动任何布局/交互
+if THEME_NAME == "scifi":
+    DARK_STYLESHEET += f"""
+    QTabBar::tab {{
+        border-top: 2px solid transparent;
+    }}
+    QTabBar::tab:selected {{
+        border-top: 2px solid {COLOR_ACCENT};
+        background-color: {COLOR_BG_DARK};
+    }}
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+        border: 1px solid {COLOR_ACCENT};
+    }}
+    QHeaderView::section {{
+        letter-spacing: 1px;
+        border: none;
+        border-bottom: 1px solid {COLOR_ACCENT};
+        border-right: 1px solid {COLOR_BORDER};
+    }}
+    QToolTip {{
+        background-color: {COLOR_BG_PANEL};
+        color: {COLOR_TEXT};
+        border: 1px solid {COLOR_ACCENT};
+    }}
+    QScrollBar::handle:vertical {{
+        background-color: {COLOR_BG_PANEL};
+        border: 1px solid {COLOR_BORDER};
+        border-radius: 0;
+    }}
+    QSplitter::handle {{
+        background-color: {COLOR_BG_DARK};
+    }}
+"""
+
 
 class MainWindow(QMainWindow):
     """Main application window."""
@@ -143,9 +181,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IBKR 点价交易")
-        # 较小的最小尺寸 → 窗口可上下左右自由缩放; 实际大小由 _restore_layout 恢复
-        self.setMinimumSize(900, 600)
-        self.resize(1400, 900)
+        # 最小尺寸随屏幕收缩 → 小屏/高 DPI 缩放下窗口仍能放进可用区域。
+        # 硬写 900x600 在 1707x1067 (2560x1600 @150%) 这类逻辑分辨率下会顶满,
+        # 导致各模块被挤到最小高度 (期权链只剩一行)。实际大小由 _restore_layout 定。
+        avail = self._available_rect()
+        self.setMinimumSize(
+            min(760, max(480, avail.width() - 40)),
+            min(520, max(400, avail.height() - 60)),
+        )
+        self._fit_to_screen(save=False)
 
         # 记忆窗口大小与各 splitter 分割位置 (跨会话持久化)
         self._settings = QSettings("MoneyTrader", "ibkr_options_gui")
@@ -164,7 +208,7 @@ class MainWindow(QMainWindow):
                 OrderType.MARKET if market else OrderType.LIMIT, lmt, qty, outside),
             subscribe=lambda opt: self._active_engine.subscribe_option_tick(opt),
             unsubscribe=lambda req_id: self._active_engine.unsubscribe_tick(req_id),
-            subscribe_under=lambda symbol: self._active_engine.subscribe_stock_tick(symbol),
+            subscribe_under=lambda symbol: self._active_engine.subscribe_watch_tick(symbol),
             get_position_qty=lambda key: self._active_engine.get_position_qty(key),
             positions_ready=lambda: self._active_engine.positions_synced,
         )
@@ -194,6 +238,11 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+
+        # 关掉所有输入框的输入法挂载 —— 搜狗拼音一挂上来就弹 SoPY_Status 空窗
+        # 并卡 1-3 秒 (双击监控切合约时必现)。详见 widgets/ui_util.disable_ime。
+        # 必须放在 _build_ui 之后: 只对已经建好的控件生效。
+        disable_ime(self)
 
         self.setStyleSheet(DARK_STYLESHEET)
         self.statusBar().showMessage("就绪 — 点击「连接」开始")
@@ -231,6 +280,33 @@ class MainWindow(QMainWindow):
         self._chart_btn.clicked.connect(self._on_open_chart)
         top_bar_layout.addWidget(self._chart_btn)
 
+        # ── 布局菜单: 适应屏幕 / 重置布局 / 期权链最大化 ──
+        # 记忆的分割位置一旦存坏 (或换了分辨率更小的屏), 就会一直复现;
+        # 这里给一个一键恢复的出口, 免得只能去删注册表。
+        self._layout_btn = QPushButton("布局 ▾")
+        self._layout_btn.setFixedHeight(30)
+        self._layout_btn.setStyleSheet(self._chart_btn.styleSheet())
+        self._layout_btn.setToolTip(
+            "适应屏幕 — 窗口缩放到当前屏幕并按比例重排各模块\n"
+            "重置布局 — 丢弃记忆的窗口大小/分割位置, 恢复出厂默认\n"
+            "期权链最大化 — 把纵向空间尽量让给期权链"
+        )
+        layout_menu = QMenu(self)
+        act_fit = QAction("适应屏幕", self)
+        act_fit.setShortcut("Ctrl+0")
+        act_fit.triggered.connect(self._on_fit_to_screen)
+        act_reset = QAction("重置布局 (恢复默认)", self)
+        act_reset.triggered.connect(self._on_reset_layout)
+        act_max_chain = QAction("期权链最大化", self)
+        act_max_chain.setShortcut("Ctrl+1")
+        act_max_chain.triggered.connect(self._on_maximize_chain)
+        for a in (act_fit, act_max_chain, act_reset):
+            layout_menu.addAction(a)
+            self.addAction(a)  # 让快捷键在无菜单弹出时也生效
+        layout_menu.insertSeparator(act_reset)
+        self._layout_btn.setMenu(layout_menu)
+        top_bar_layout.addWidget(self._layout_btn)
+
         # Session indicator (shows current market session for SPX options)
         self._session_label = QLabel("--")
         self._session_label.setFixedHeight(30)
@@ -257,6 +333,10 @@ class MainWindow(QMainWindow):
 
         # Top: Option chain
         self.option_chain = OptionChainWidget()
+        # 期权链是主视图 → 优先吸收纵向空间, 且给一个「至少看得见几行」的地板,
+        # 免得下方点价梯的固定高度控件把它挤成一行。
+        self.option_chain.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.option_chain.setMinimumHeight(self._px(150))
         self.main_splitter.addWidget(self.option_chain)
 
         # Bottom: horizontal splitter (price ladder | position/order panels)
@@ -279,7 +359,18 @@ class MainWindow(QMainWindow):
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.addWidget(self.right_tabs)
         self.calculator = OptionCalculator()
-        self.right_splitter.addWidget(self.calculator)
+        # 计算器内容比较高 (两列 + 多行输入)。放进滚动区后:
+        #   · 空间够 → 和以前一样铺满 (setWidgetResizable);
+        #   · 空间不够 → 出滚动条, 用滚轮看全, 而不是把内容截断/顶掉别的模块。
+        self._calc_scroll = QScrollArea()
+        self._calc_scroll.setWidget(self.calculator)
+        self._calc_scroll.setWidgetResizable(True)
+        self._calc_scroll.setFrameShape(QFrame.NoFrame)
+        self._calc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._calc_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # 滚动区自身的地板要小, 否则它又变成一个撑住布局的固定块
+        self._calc_scroll.setMinimumHeight(self._px(90))
+        self.right_splitter.addWidget(self._calc_scroll)
         self.right_splitter.setSizes([520, 300])
         # 右侧竖向: 持仓/委托 Tab 主要吸收增长, 计算器小幅跟随
         self.right_splitter.setStretchFactor(0, 5)
@@ -294,11 +385,15 @@ class MainWindow(QMainWindow):
         self.bottom_splitter.setChildrenCollapsible(False)
         self.main_splitter.addWidget(self.bottom_splitter)
 
-        self.main_splitter.setSizes([400, 400])
-        # 主竖向: 期权链与下方区域等比例联动缩放
-        self.main_splitter.setStretchFactor(0, 1)
-        self.main_splitter.setStretchFactor(1, 1)
+        # 主竖向: 期权链略优先 (3:2) —— 它是主视图, 且行数多才有用
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
         self.main_splitter.setChildrenCollapsible(False)
+
+        # 分隔条加宽 → 好拖。三个 splitter 统一手感。
+        for sp in (self.main_splitter, self.bottom_splitter, self.right_splitter):
+            sp.setHandleWidth(self._px(6))
+            sp.setOpaqueResize(True)
 
         # ── 中央: 顶层 Tab —「单腿点价」(现有点价梯) /「多腿组合」(策略组合) ──
         # 两个模块相互独立: 单腿点价用左侧点价梯; 多腿组合是嵌入的策略生成器。
@@ -314,13 +409,15 @@ class MainWindow(QMainWindow):
         self.strategy_panel = StrategyPanel(symbol=self._current_symbol)
         self.center_tabs.addTab(self.strategy_panel, "多腿组合")
 
-        main_layout.addWidget(self.center_tabs)
+        # stretch=1 → 中央 Tab 吃掉顶栏 (30px) 与账户栏 (56px) 之外的全部纵向空间
+        main_layout.addWidget(self.center_tabs, stretch=1)
 
     def _connect_signals(self):
         # Symbol bar
         self.symbol_bar.connect_clicked.connect(self._on_connect)
         self.symbol_bar.disconnect_clicked.connect(self._on_disconnect)
         self.symbol_bar.symbol_changed.connect(self._on_symbol_changed)
+        self.symbol_bar.theme_changed.connect(self._on_theme_changed)
         self.symbol_bar.mode_changed.connect(self._on_mode_changed)
         self.symbol_bar.reconnect_requested.connect(self._on_reconnect_requested)
         self.symbol_bar.instrument_changed.connect(self._on_instrument_changed)
@@ -368,8 +465,20 @@ class MainWindow(QMainWindow):
         # Position panel -> open ladder
         self.position_panel.position_clicked.connect(self._on_option_selected)
 
+        # Position panel -> 一键平仓 (面板已弹窗确认过, 这里只负责逐笔下单)
+        self.position_panel.close_all_requested.connect(self._on_close_all_positions)
+
+        # Position panel -> 账户栏: 账户级未实现盈亏 (持仓汇总)。IBKR 的 reqPnL /
+        # reqPnLSingle 在部分账户上不给有效浮盈亏 (error 2150), 账户栏改吃这个汇总值。
+        self.position_panel.portfolio_unrealized_changed.connect(
+            self.account_bar.on_portfolio_unrealized
+        )
+
         # 双击委托/交易记录的合约 -> 跳到该标的并加载到点价梯
         self.order_panel.option_selected.connect(self._on_option_selected)
+
+        # 双击监控 (watch list) 的合约名 -> 同样跳到点价梯/期权链
+        self.watch_panel.option_selected.connect(self._on_option_selected)
 
         # Order panel -> cancel
         self.order_panel.cancel_requested.connect(self._on_cancel_order)
@@ -519,6 +628,46 @@ class MainWindow(QMainWindow):
         self._active_engine.request_pnl()
 
     # ── Symbol / Mode ─────────────────────────────────────────────────
+
+    def _on_theme_changed(self, name: str):
+        """顶栏「主题」切换: 保存选择 → 询问是否立即重启 (主题重启后生效)。
+
+        206 处内联样式在各 widget 构建时就用 f-string 固化了颜色值,
+        运行中无法整体重绘 —— 故采用保存 + 重启方案。"""
+        if name == THEME_NAME:
+            return
+        try:
+            save_theme_name(name)
+        except Exception as e:
+            QMessageBox.warning(self, "主题", f"保存主题设置失败: {e}")
+            return
+        resp = QMessageBox.question(
+            self, "切换主题",
+            "主题将在重启后生效。是否立即重启程序?\n"
+            "(重启会断开当前连接; 挂单在 IBKR 服务器上不受影响)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if resp == QMessageBox.Yes:
+            self._restart_app()
+
+    def _restart_app(self):
+        """自重启: 先正常 close (保存窗口布局/断开连接), 再拉起新进程。
+
+        新进程入口与当前一致 (main.py / main_gw.py); 其 kill_previous_instances
+        只按脚本名杀旧进程, 此时旧进程已在退出中, 无竞态。"""
+        import os
+        import subprocess
+        import sys
+        script = os.path.abspath(sys.argv[0])
+        self.close()
+        try:
+            subprocess.Popen(
+                [sys.executable, script],
+                cwd=os.path.dirname(script),
+                close_fds=True,
+            )
+        except Exception as e:
+            print(f"[THEME] 重启失败: {e}", flush=True)
 
     def _on_symbol_changed(self, symbol: str):
         self._current_symbol = symbol
@@ -684,7 +833,9 @@ class MainWindow(QMainWindow):
 
     # ── Option Chain Loading ──────────────────────────────────────────
 
-    def _load_option_chain(self, symbol: str):
+    def _load_option_chain(self, symbol: str, jump_expiry: str = ""):
+        """加载标的期权链; jump_expiry 非空时, 链加载完成后自动选中该到期日 Tab
+        (双击期权持仓/监控/委托跳转用; 正股/期货不传)。"""
         self.statusBar().showMessage(f"加载 {symbol} 期权链...")
 
         def do_load():
@@ -724,6 +875,8 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG] on_chain_ready: {sym}, price={price}, "
                       f"{len(exps)} exp, {len(stks)} strikes", flush=True)
                 self.option_chain.load_chain(sym, exps, stks, stock_price=price)
+                if jump_expiry and sym == symbol:
+                    self.option_chain.select_expiry(jump_expiry)
                 self.statusBar().showMessage(
                     f"{sym} 期权链已加载: {len(exps)} 个到期日, "
                     f"{len(stks)} 个行权价 (股价=${price:.2f})"
@@ -762,7 +915,10 @@ class MainWindow(QMainWindow):
         self._stock_price_req_id = req_id
         self._stock_price_key = key
         app._tick_req_to_key[req_id] = key
-        app._tick_data[key] = {"bid": 0.0, "ask": 0.0, "last": 0.0}
+        # 保留该标的上一次的报价, 不要清零 —— 来回切标的时清零会让下面那个循环
+        # 重新空等最多 5 秒 (期权链要等它返回才渲染)。旧价几秒内足够当初值,
+        # 新 tick 一到就覆盖。首次订阅才建空表。
+        app._tick_data.setdefault(key, {"bid": 0.0, "ask": 0.0, "last": 0.0})
         app._active_mkt_data_reqs.add(req_id)
         # generic tick 106 = Option Implied Volatility → 标的 IV (tickGeneric tickType 24),
         # 显示在期权链标题价格右侧。指数(SPX 等)可能不下发, 缺则标题不显示 IV。
@@ -821,13 +977,18 @@ class MainWindow(QMainWindow):
             return
 
         # 期权 (C/P): 若属于另一个标的则切换标的并重载期权链 (并切回期权模式)
+        opt_expiry = getattr(option, "expiry", "") if right in ("C", "P") else ""
         if sym and right != "COMBO" and (sym != self._current_symbol
                                          or self._instrument != "OPT"):
             self._current_symbol = sym
             self.symbol_bar.set_symbol(sym)
             self._set_instrument_ui("OPT")
             if self.ibkr_engine.is_connected:
-                self._load_option_chain(sym)
+                # 链加载完成后自动跳到该期权的到期日 Tab
+                self._load_option_chain(sym, jump_expiry=opt_expiry)
+        elif opt_expiry:
+            # 同标的且期权链已在: 直接跳到该合约的到期日 Tab
+            self.option_chain.select_expiry(opt_expiry)
         # 加载到点价梯 + 计算器 (点价交易界面就在左侧, 一直可见)
         self.price_ladder.set_option(option)
         self.calculator.set_option(option)
@@ -923,6 +1084,34 @@ class MainWindow(QMainWindow):
                                            outside_rth=outside_rth)
         return -1
 
+    def _confirm_sell_to_open(self, option: OptionInfo, qty: int) -> bool:
+        """卖出数量超过实际持仓 (= 会开出空头) → **直接拦截**, 返回 True=放行。
+
+        点价梯停在未持仓合约时误点「市价卖出」可能意外开出裸空腿。
+        2026-07-10 起从「弹确认框可放行」改为**无条件拦截**
+        (只弹提示框说明原因, 无放行选项)。
+        (市价平仓按钮/条件单有各自的持仓校验; 多腿组合走 combo 下单不经此处,
+        价差空腿属有意为之, 不受影响。)
+        """
+        eng = self._active_engine
+        if not getattr(eng, "positions_synced", True):
+            held = 0
+            note = "\n(持仓快照尚未就绪, 按 0 持仓对待)"
+        else:
+            held = eng.get_position_qty(option.to_ibkr_key())
+            note = ""
+        if qty <= held:
+            return True
+        QMessageBox.warning(
+            self, "已拦截: 不允许卖空",
+            f"{option.display_name}\n当前持仓 {held}{self._unit_for(option)}, "
+            f"卖出 {qty}{self._unit_for(option)} 会开出 "
+            f"{qty - held}{self._unit_for(option)} 空头。{note}\n\n"
+            f"本程序不允许卖空, 该卖单已拦截。\n"
+            f"(想平仓请核对合约行权价/到期日; 价差空腿请用多腿组合下单)",
+        )
+        return False
+
     def _on_order_requested(self, option: OptionInfo, action_str: str, price: float):
         action = OrderAction.BUY if action_str == "BUY" else OrderAction.SELL
 
@@ -934,13 +1123,20 @@ class MainWindow(QMainWindow):
         qty = self.price_ladder.get_quantity()
         outside_rth = self.price_ladder.get_outside_rth()
 
+        if action == OrderAction.SELL and not self._confirm_sell_to_open(option, qty):
+            self.statusBar().showMessage("已拦截: 卖出数量超过持仓 (不允许卖空)")
+            return
+
         order_id = self._place_order(option, action, OrderType.LIMIT, price, qty,
                                      outside_rth)
         if order_id > 0:
+            self.price_ladder.reset_quantity()   # 每笔提交后数量复位 1
             action_text = "买入" if action == OrderAction.BUY else "卖出"
             rth_tag = " [盘外]" if outside_rth else ""
             msg = (f"已提交: {action_text} {qty}{self._unit_for(option)} "
                    f"{option.display_name} @ ${price:.2f}{rth_tag}")
+            if action == OrderAction.SELL:
+                msg += self._cancel_conds_on_manual_sell(option)
             # 限价开多: 等成交回报后再挂止盈/止损 (避免挂单未成交时误触发开出反向单)
             if bracket:
                 self._pending_buy_brackets[order_id] = {
@@ -964,14 +1160,21 @@ class MainWindow(QMainWindow):
         qty = self.price_ladder.get_quantity()
         outside_rth = self.price_ladder.get_outside_rth()
 
+        if action == OrderAction.SELL and not self._confirm_sell_to_open(option, qty):
+            self.statusBar().showMessage("已拦截: 卖出数量超过持仓 (不允许卖空)")
+            return
+
         order_id = self._place_order(option, action, OrderType.MARKET, 0.0, qty,
                                      outside_rth)
         if order_id > 0:
+            self.price_ladder.reset_quantity()   # 每笔提交后数量复位 1
             action_text = "市价买入" if action == OrderAction.BUY else "市价卖出"
             rth_tag = " [盘外]" if outside_rth else ""
+            sell_note = (self._cancel_conds_on_manual_sell(option)
+                         if action == OrderAction.SELL else "")
             self.statusBar().showMessage(
                 f"已提交: {action_text} {qty}{self._unit_for(option)} "
-                f"{option.display_name}{rth_tag}"
+                f"{option.display_name}{rth_tag}{sell_note}"
             )
             # 市价开多附带条件单:
             #  - 绝对价(期权): 触发价已知, 成交即时 → 立刻挂;
@@ -1136,9 +1339,53 @@ class MainWindow(QMainWindow):
             order_id = self._place_order(option, OrderAction.SELL,
                                          OrderType.MARKET, 0.0, qty, outside_rth)
         if order_id > 0:
+            self.price_ladder.reset_quantity()   # 每笔提交后数量复位 1
             rth_tag = " [盘外]" if outside_rth else ""
-            self.statusBar().showMessage(f"已提交平仓: {option.display_name}{rth_tag}")
+            note = self._cancel_conds_on_manual_sell(option)
+            self.statusBar().showMessage(
+                f"已提交平仓: {option.display_name}{rth_tag}{note}")
             self.right_tabs.setCurrentIndex(1)
+
+    def _on_close_all_positions(self, items: list):
+        """一键平仓 —— 逐笔下市价单平掉列表里的持仓。
+
+        确认弹窗已由持仓面板出过 (列出了每一笔), 到这里就是执行。
+        多头卖出 / 空头买回按 qty 符号决定; 每笔独立下单, 单笔失败不影响其余,
+        逐笔结果写日志, 最后在状态栏汇总成功/失败笔数。
+        """
+        if not items:
+            return
+        outside_rth = self.price_ladder.get_outside_rth()
+        ok, failed = 0, []
+        for it in items:
+            option = it["option"]
+            qty = int(it["qty"])
+            action = OrderAction.SELL if qty > 0 else OrderAction.BUY
+            try:
+                order_id = self._place_order(option, action, OrderType.MARKET,
+                                             0.0, abs(qty), outside_rth)
+            except Exception as e:
+                order_id = -1
+                print(f"[CLOSE ALL] {it['name']} 下单异常: {e}", flush=True)
+            if order_id > 0:
+                ok += 1
+                print(f"[CLOSE ALL] {it['name']} {action.value} {abs(qty)} "
+                      f"→ orderId={order_id}", flush=True)
+                # 该合约挂着的本地条件单 (止盈/止损) 随手动平仓一起作废
+                self._cancel_conds_on_manual_sell(option)
+            else:
+                failed.append(it["name"])
+                print(f"[CLOSE ALL] {it['name']} 下单失败", flush=True)
+
+        rth_tag = " [盘外]" if outside_rth else ""
+        msg = f"一键平仓: 已提交 {ok}/{len(items)} 笔市价单{rth_tag}"
+        if failed:
+            msg += f" — 失败: {', '.join(failed)}"
+            self.statusBar().setStyleSheet(f"QStatusBar {{ color: {COLOR_RED}; }}")
+        else:
+            self.statusBar().setStyleSheet("")
+        self.statusBar().showMessage(msg)
+        self.right_tabs.setCurrentIndex(1)   # 跳到委托页看成交回报
 
     def _on_cancel_all_requested(self):
         """Handle cancel all orders from price ladder."""
@@ -1208,14 +1455,19 @@ class MainWindow(QMainWindow):
             else:
                 self.cond_manager.arm(opt, "SL", sl, sl, qty, outside)
                 msgs.append(f"止损(本地≤{sl:.2f}{off})")
-        # 标的价触发 → 市价卖出 (本地监控标的价, 仅期权适用)
+        # 标的价触发 → 市价卖出 (本地监控标的价, 仅期权适用)。
+        # 监控标的默认期权自己的标的, 可指定其它 (如 SPY 期权盯 SPX/ES)
         if req.get("ul_on") and opt.right in ("C", "P"):
             ul = round(req.get("ul_price", 0.0), 2)
             direction = req.get("ul_dir", "UP")
+            watch_sym = (req.get("ul_sym") or "").upper()
+            if watch_sym == opt.symbol.upper():
+                watch_sym = ""   # 选了自己 = 默认
             arrow = "≥" if direction == "UP" else "≤"
             self.cond_manager.arm(opt, "UL", ul, 0.0, qty, outside,
-                                  watch="UNDER", direction=direction, market=True)
-            msgs.append(f"标的{arrow}{ul:.2f}→市价卖{qty}")
+                                  watch="UNDER", direction=direction, market=True,
+                                  watch_symbol=watch_sym)
+            msgs.append(f"{watch_sym or '标的'}{arrow}{ul:.2f}→市价卖{qty}")
         if msgs:
             tag = "" if native else " (本地: 仅程序运行时监控)"
             self.statusBar().showMessage("已挂条件单: " + " + ".join(msgs) + tag)
@@ -1226,6 +1478,23 @@ class MainWindow(QMainWindow):
     def _on_conditional_cancel(self, cond_id: int):
         self.cond_manager.cancel(cond_id)
         self.statusBar().showMessage(f"已取消本地条件单 #{cond_id}")
+
+    def _cancel_conds_on_manual_sell(self, option: OptionInfo) -> str:
+        """手动卖出后自动取消该合约的**全部本地条件单** (用户要求 2026-07-10)。
+
+        卖出后不清, 残留的止盈/止损/标的价条件单会在之后重新买入同合约时,
+        按旧触发价把新仓位卖掉。返回追加到状态栏的提示 ("" = 本无条件单)。
+        条件单自身触发的卖出不走本方法 (只清手动卖出)。
+        """
+        key = option.to_ibkr_key()
+        n = len(self.cond_manager.for_key(key))
+        if n == 0:
+            return ""
+        self.cond_manager.cancel_for_key(key)
+        self._refresh_conditionals()
+        print(f"[COND] 手动卖出 {option.display_name} → 自动取消该合约 "
+              f"{n} 条本地条件单", flush=True)
+        return f"; 已自动取消该合约 {n} 条条件单"
 
     def _refresh_conditionals(self):
         """把当前点价梯合约的本地条件单推给点价梯显示。"""
@@ -1307,7 +1576,13 @@ class MainWindow(QMainWindow):
                     old.raise_()
                     old.activateWindow()
                     return
-                old.close()  # 停止取数并销毁 (destroyed → _on_option_chart_destroyed)
+                # 换合约**就地复用**这个窗口, 不再 close + new。原来每切一次都要销毁
+                # 重建整个窗口 (两个 pyqtgraph PlotWidget + 全套 UI), 任务栏还会闪出
+                # 一个新窗口 —— 就是那个"每次切换都弹出来的加载窗口"。
+                old.set_option(option)
+                old.raise_()
+                old.activateWindow()
+                return
             except RuntimeError:
                 pass  # C++ 对象已销毁 (窗口早被用户关掉), 直接开新的
             self._option_chart = None
@@ -1348,8 +1623,16 @@ class MainWindow(QMainWindow):
         # Create standalone window for the price ladder
         self._ladder_window = QMainWindow(None)
         self._ladder_window.setWindowTitle("点价交易")
-        self._ladder_window.setMinimumSize(420, 600)
-        self._ladder_window.resize(440, 800)
+        # 弹出窗也要放得进屏幕 (旧的写死 600 高在矮屏上会超出可用区)
+        _avail = self._available_rect()
+        self._ladder_window.setMinimumSize(
+            min(self._px(420), max(320, _avail.width() - 40)),
+            min(self._px(600), max(400, _avail.height() - 60)),
+        )
+        self._ladder_window.resize(
+            min(self._px(440), _avail.width() - self._px(20)),
+            min(self._px(800), _avail.height() - self._px(20)),
+        )
         self._ladder_window.setCentralWidget(self.price_ladder)
         self._ladder_window.setStyleSheet(DARK_STYLESHEET)
         self._ladder_window.installEventFilter(self)
@@ -1376,7 +1659,10 @@ class MainWindow(QMainWindow):
             placeholder.setObjectName("chart_placeholder")
             self.bottom_splitter.insertWidget(0, placeholder)
 
-        self.bottom_splitter.setSizes([500, 380])
+        # 图表占左侧 (比点价梯宽一点), 按当前实际宽度取比例
+        _tw = max(self.bottom_splitter.width(), self._px(700))
+        _chart_w = max(int(_tw * 0.55), self._px(320))
+        self.bottom_splitter.setSizes([_chart_w, max(_tw - _chart_w, self._px(280))])
         # insertWidget 会把新 index0 的 stretch 重置, 重新设回比例联动
         self.bottom_splitter.setStretchFactor(0, 4)
         self.bottom_splitter.setStretchFactor(1, 5)
@@ -1405,7 +1691,10 @@ class MainWindow(QMainWindow):
         # Reparent price ladder back into the splitter
         self.price_ladder.setParent(None)
         self.bottom_splitter.insertWidget(0, self.price_ladder)
-        self.bottom_splitter.setSizes([380, 500])
+        _tw = max(self.bottom_splitter.width(), self._px(700))
+        _ladder_w = max(int(_tw * 4 / 9), self._px(380))
+        _ladder_w = min(_ladder_w, max(_tw - self._px(280), self._px(380)))
+        self.bottom_splitter.setSizes([_ladder_w, max(_tw - _ladder_w, self._px(280))])
         # 重新设回 stretch (insertWidget 重置了 index0 的 stretch factor)
         self.bottom_splitter.setStretchFactor(0, 4)
         self.bottom_splitter.setStretchFactor(1, 5)
@@ -1546,21 +1835,194 @@ class MainWindow(QMainWindow):
             ("right", self.right_splitter),
         )
 
+    # ── 屏幕自适应基础设施 ──────────────────────────────────────────
+
+    def _px(self, value: int) -> int:
+        """按屏幕 DPI 缩放一个基准像素值 (基准 = 96 DPI)。
+
+        开了 AA_EnableHighDpiScaling 时 Qt 已按逻辑坐标工作, 这里通常返回原值;
+        未开或整数倍缩放场景下仍能把「地板/手柄宽」按比例放大。
+        """
+        try:
+            screen = self.screen() if hasattr(self, "screen") else None
+            dpi = screen.logicalDotsPerInch() if screen else 96.0
+        except Exception:
+            dpi = 96.0
+        scale = max(1.0, min(dpi / 96.0, 3.0))
+        return int(round(value * scale))
+
+    def _available_rect(self) -> QRect:
+        """当前窗口所在屏幕的**可用**区域 (已扣掉任务栏)。"""
+        try:
+            screen = None
+            if self.windowHandle() is not None:
+                screen = self.windowHandle().screen()
+            if screen is None:
+                cursor_screen = QApplication.screenAt(self.pos()) if self.pos() else None
+                screen = cursor_screen or QApplication.primaryScreen()
+            if screen is not None:
+                return screen.availableGeometry()
+        except Exception:
+            pass
+        return QRect(0, 0, 1280, 800)
+
+    def _fit_to_screen(self, save: bool = True):
+        """把窗口缩放到当前屏幕可用区域内并居中。
+
+        目标尺寸取「理想大小」与「屏幕可用区」的较小者 → 永远不会超出屏幕,
+        也不会在大屏上被钉死在 1400x900。
+        """
+        avail = self._available_rect()
+        w = min(1400, avail.width() - self._px(20))
+        h = min(900, avail.height() - self._px(20))
+        w = max(w, self.minimumWidth())
+        h = max(h, self.minimumHeight())
+        self.resize(w, h)
+        # 居中到该屏幕的可用区
+        x = avail.x() + max(0, (avail.width() - w) // 2)
+        y = avail.y() + max(0, (avail.height() - h) // 2)
+        self.move(x, y)
+        if save:
+            self._apply_default_splitter_sizes()
+
+    def _apply_default_splitter_sizes(self):
+        """按当前实际高度/宽度**按比例**重排三个 splitter。
+
+        取代原来写死的 setSizes([400,400]) / [380,500] / [520,300] ——
+        写死的绝对像素在小屏 (或高 DPI 缩放后的小逻辑分辨率) 上会让
+        期权链只剩一行。
+        """
+        # 主竖向: 期权链 : 下方 = 3 : 2, 但期权链至少留够看 ~8 行
+        total_h = max(self.main_splitter.height(), self._px(400))
+        chain_h = max(int(total_h * 0.55), self._px(240))
+        chain_h = min(chain_h, total_h - self._px(220))  # 给下方留活路
+        chain_h = max(chain_h, self._px(150))
+        self.main_splitter.setSizes([chain_h, max(total_h - chain_h, self._px(150))])
+
+        # 下方横向: 点价梯 : 右侧面板 ≈ 4 : 5, 点价梯至少 380 (表头固定宽度之和)
+        total_w = max(self.bottom_splitter.width(), self._px(700))
+        ladder_w = max(int(total_w * 4 / 9), self._px(380))
+        ladder_w = min(ladder_w, max(total_w - self._px(280), self._px(380)))
+        self.bottom_splitter.setSizes([ladder_w, max(total_w - ladder_w, self._px(280))])
+
+        # 右侧竖向: 持仓/委托 Tab : 计算器 ≈ 5 : 3 (计算器已可滚动, 挤一点没关系)
+        total_rh = max(self.right_splitter.height(), self._px(400))
+        tabs_h = max(int(total_rh * 0.6), self._px(200))
+        tabs_h = min(tabs_h, max(total_rh - self._px(150), self._px(200)))
+        self.right_splitter.setSizes([tabs_h, max(total_rh - tabs_h, self._px(90))])
+
+    def _splitter_state_is_sane(self, name: str, splitter: QSplitter, sizes) -> bool:
+        """恢复出来的分割位置是否还「能看」。
+
+        存坏的状态 (某一格被压到只剩一行) 会被 restoreState 永久复现 ——
+        用户拖窗口也救不回来, 因为 restoreState 覆盖了 setSizes 默认值。
+        这里对明显不合理的状态直接丢弃, 回落到按比例的默认布局。
+        """
+        if not sizes or len(sizes) < 2:
+            return False
+        if any(s <= 0 for s in sizes):   # 有面板被完全折叠
+            return False
+        floors = {
+            "main": (self._px(150), self._px(150)),
+            "bottom": (self._px(300), self._px(240)),
+            "right": (self._px(140), self._px(70)),
+        }
+        floor = floors.get(name)
+        if floor is None:
+            return True
+        return all(s >= f for s, f in zip(sizes, floor))
+
     def _restore_layout(self):
-        """恢复上次会话的窗口几何与各 splitter 分割位置 (首次运行则用默认值)。"""
+        """恢复上次会话的窗口几何与各 splitter 分割位置 (首次运行则用默认值)。
+
+        恢复前先做两道体检, 任一不过就回落到「适应屏幕 + 比例布局」:
+          1. 几何是否还落在当前某块屏幕内 (换了小屏/改了缩放 → 旧几何作废);
+          2. 各分割位置是否把某个模块压到了不可用的高度。
+        """
         geo = self._settings.value("geometry")
+        restored_geo = False
         if geo is not None:
-            self.restoreGeometry(geo)
+            restored_geo = self.restoreGeometry(geo)
+        if restored_geo and not self._geometry_fits_screen():
+            restored_geo = False
+        if not restored_geo:
+            self._fit_to_screen(save=False)
+
+        # splitter 尺寸依赖于窗口的最终大小 → 等布局跑完再校验/落位
+        QTimer.singleShot(0, self._restore_splitters)
+
+    def _geometry_fits_screen(self) -> bool:
+        """恢复出来的窗口是否仍然大体落在某块屏幕的可用区内。"""
+        if self.isMaximized() or self.isFullScreen():
+            return True
+        frame = self.frameGeometry()
+        for screen in QApplication.screens():
+            avail = screen.availableGeometry()
+            if not avail.intersects(frame):
+                continue
+            # 标题栏要够得着 (能拖动), 且窗口不能明显大于该屏
+            visible = avail.intersected(frame)
+            title_visible = visible.height() >= self._px(28) and visible.width() >= self._px(120)
+            fits = (frame.width() <= avail.width() + self._px(8)
+                    and frame.height() <= avail.height() + self._px(8))
+            if title_visible and fits:
+                return True
+        return False
+
+    def _restore_splitters(self):
+        """校验并应用记忆的分割位置; 不合理则用按比例的默认布局。"""
+        self._apply_default_splitter_sizes()   # 先铺一个合理底板
         for name, splitter in self._layout_splitters():
             state = self._settings.value(f"splitter/{name}")
-            if state is not None:
-                splitter.restoreState(state)
+            if state is None:
+                continue
+            before = splitter.sizes()
+            if not splitter.restoreState(state):
+                continue
+            if not self._splitter_state_is_sane(name, splitter, splitter.sizes()):
+                splitter.setSizes(before)   # 状态存坏了 → 退回默认比例
+                self._settings.remove(f"splitter/{name}")
 
     def _save_layout(self):
-        """保存当前窗口几何与各 splitter 分割位置。"""
+        """保存当前窗口几何与各 splitter 分割位置。
+
+        只保存**通过体检**的分割位置 —— 否则一次意外的压扁会被永久记住。
+        """
         self._settings.setValue("geometry", self.saveGeometry())
         for name, splitter in self._layout_splitters():
-            self._settings.setValue(f"splitter/{name}", splitter.saveState())
+            if self._splitter_state_is_sane(name, splitter, splitter.sizes()):
+                self._settings.setValue(f"splitter/{name}", splitter.saveState())
+            else:
+                self._settings.remove(f"splitter/{name}")
+
+    # ── 布局菜单动作 ────────────────────────────────────────────────
+
+    def _on_fit_to_screen(self):
+        """窗口缩放到当前屏幕 + 各模块按比例重排。"""
+        if self.isMaximized() or self.isFullScreen():
+            self.showNormal()
+        self._fit_to_screen(save=False)
+        self._apply_default_splitter_sizes()
+        self.statusBar().showMessage("布局已适应当前屏幕", 3000)
+
+    def _on_reset_layout(self):
+        """丢弃记忆的窗口大小/分割位置, 恢复出厂默认。"""
+        for name, _ in self._layout_splitters():
+            self._settings.remove(f"splitter/{name}")
+        self._settings.remove("geometry")
+        self._settings.sync()
+        if self.isMaximized() or self.isFullScreen():
+            self.showNormal()
+        self._fit_to_screen(save=False)
+        self._apply_default_splitter_sizes()
+        self.statusBar().showMessage("布局已重置为默认 (记忆的分割位置已清除)", 4000)
+
+    def _on_maximize_chain(self):
+        """把纵向空间尽量让给期权链 (下方压到各自地板)。"""
+        total = max(self.main_splitter.height(), self._px(400))
+        bottom = self._px(220)
+        self.main_splitter.setSizes([max(total - bottom, self._px(150)), bottom])
+        self.statusBar().showMessage("期权链已最大化 (Ctrl+0 恢复比例布局)", 3000)
 
     def closeEvent(self, event):
         # Stop session timer

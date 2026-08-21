@@ -5,7 +5,7 @@
 (`combo_analyzer.py`,clientId=12)。核心特性:Futu 风格点价梯(深度摆盘 + 点击下单)、
 期权 T 型报价链、多腿组合策略、K 线图、实时持仓与每仓位今日盈亏、真实/模拟双引擎切换。
 
-> 项目整体背景见上层 `../CLAUDE.md`。本文件只详述 `ibkr_trader/` 目录。
+**当前公开版本: `v1.2.0` (2026-08-21)。**
 
 > **📌 维护约定(必读)**:本文件是 `ibkr_trader/` 的**唯一总体文档**,作为活文档维护。
 > **每次改动本目录的代码(新增/删除文件、改架构、改配置、修 bug、调行为)后,必须同步更新本文件**:
@@ -63,7 +63,7 @@ ibkr_trader/
 ├── ibkr_engine.py          # IBKR API 引擎 (EWrapper/EClient + 下单/撤单 + Qt 信号桥)  ★核心
 ├── paper_engine.py         # 模拟交易引擎 (复用 IBKR 行情, 本地撮合成交)
 ├── conditional_orders.py   # 本地条件单管理器 (止盈/止损限价 + 标的价触发市价卖出, 持久化 conditional_orders.json; 触发时按 API 持仓核对数量、仓位已平/合约过期自动作废、arm 去重)
-├── watchlist.py            # 自选监控管理器 (0.5s 巡检现价 + 高于/低于到价警报(一次性), 持久化 watchlist.json, 启动自动清理过期合约)
+├── watchlist.py            # 自选监控管理器 (0.5s 巡检现价 + 每合约任意多条到价警报(一次性, 右键追加), 持久化 watchlist.json, 启动自动清理过期合约)
 ├── models.py               # 纯数据模型 (dataclass + Enum), 无 Qt/IBKR 依赖
 ├── config.py               # 全部常量 (连接/费率/颜色/tick/图表/交易时段)
 ├── single_instance.py      # 启动辅助: 杀掉同脚本的旧进程以释放 clientId
@@ -247,8 +247,8 @@ ibkr_trader/
 
 | 文件 | 角色与要点 |
 |------|-----------|
-| `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认)。 |
-| `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。**双击**某合约 → 打开该期权**当日 1 分钟图**(`chart_requested` → `option_chart_window.py`; 单击载入点价梯不变)。 |
+| `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认);最右**「主题」下拉**(经典/科幻,`theme_changed` → 主窗口保存并提示重启,见 §5 主题行)。 |
+| `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。**双击**某合约 → 打开该期权**当日 1 分钟图**(`chart_requested` → `option_chart_window.py`; 单击载入点价梯不变)。`select_expiry(expiry)`:外部(双击持仓/委托/监控的期权)联动选中指定到期日 Tab,不在当前 range 时自动切 range。 |
 | `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + **标的价触发行** + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。**两种用法**:「挂条件单」按钮对**当前持仓**挂;勾「**随买入单附带**」(`attach_to_buy()`)则开仓时按买入数量自动附带。**标的价触发**(仅期权):勾「标的价」+ 选方向(≥涨到/≤跌到)+ 填标的触发价 → 监控**标的**价, 到价即对本期权发**市价卖出**(本地监控; `arm(...,watch="UNDER",market=True)`)。**期货**条件单输入切到「**+点/−点**」(`_sync_cond_input_mode()`,相对入场价),`get_bracket(require_both)` 返回带 `by_points` 的配置;`open_cond_panel()` 展开面板。 |
 | `watch_panel.py` (≈220) | **自选监控面板** (right_tabs 第三个 Tab「监控」, 与持仓/委托同窗口点击切换)。表: 合约/现价/⚠≥/⚠≤/✕; 点价梯左下「☆ 加自选」把当前合约加入并自动切到该 Tab; 现价 0.5s 刷新 (Tab 不可见时跳过重绘, 警报巡检照常); 双击警报列编辑触发价 (空=关, 一次性触发后自动清除); 触发 = 声音(`sound_alerts.play_alert`, sounds/ALERT 可自定义) + 非模态弹窗 + 行高亮 3s + 状态栏。逻辑在根目录 `watchlist.py` (WatchListManager)。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选;「费$」后缀 = 该合约**今日实际佣金**(`get_position_commission`)。 |
@@ -351,9 +351,9 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 | 类别 | 关键常量 |
 |------|---------|
-| 连接 | `IBKR_HOST=127.0.0.1`;TWS `7496`(live)/`7497`(paper);Gateway `4002`(live)/`4001`(paper);`IBKR_CLIENT_ID=10`、`IBKR_STOCK_CLIENT_ID=11`、`IBKR_COMBO_CLIENT_ID=12` |
+| 连接 | `IBKR_HOST=127.0.0.1`;TWS `7496`(live)/`7497`(paper);Gateway `4001`(live)/`4002`(paper),可用 `IBKR_GW_LIVE_PORT` / `IBKR_GW_PAPER_PORT` 环境变量覆盖;`IBKR_CLIENT_ID=10`、`IBKR_COMBO_CLIENT_ID=12` |
 | 行情 | `MARKET_DATA_TYPE=1`(1实时/2冻结/3延迟/4延迟冻结);`MAX_SIMULTANEOUS_STREAMS=95` |
-| Tick | `TICK_SIZE_SMALL=0.01`/`TICK_SIZE_LARGE=0.05`/`TICK_THRESHOLD=3.0`;`LADDER_ROWS=201`;`TICK_SIZE_OVERRIDES`(SPX/XSP/NDX/RUT) |
+| Tick | `TICK_SIZE_SMALL=0.01`/`TICK_SIZE_LARGE=0.05`/`TICK_THRESHOLD=3.0`;`LADDER_ROWS=201`;`TICK_SIZE_OVERRIDES`(SPX/XSP/NDX/RUT/SPY/QQQ/IWM) |
 | 深度 | `DEPTH_ROWS=10` |
 | 费率 | 期权 `$0.65/张`,`min $1.00`;正股 `$0.005/股`,`min $1.00`;模拟起始资金 `$10000` |
 | 时段(ET) | SPX GTH 20:15→09:15,RTH 09:30→16:15,Curb 16:15→17:00;`EXTENDED_HOURS_SYMBOLS={SPX}` |
@@ -362,6 +362,7 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 | 错误码 | `IGNORED_ERROR_CODES`(静默)/`DATA_CONNECTION_ERROR_CODES`(2100/2103-2108 作警告上抛) |
 | 期权定价 | `RISK_FREE_RATE=0.045`、`DIVIDEND_YIELD=0.0`、`OPTION_MARKET_CLOSE_ET=16`、`CALCULATOR_REFRESH_MS=700`(计算器用) |
 | 图表 | `CHART_TIMEFRAMES`(1秒~月线)+ 各类颜色 |
+| 主题 | `THEMES`: `classic`(经典深蓝, 原版配色)/`scifi`(简约科幻: 近黑底+电光青+霓虹绿红, 高对比文字, 直角, Bahnschrift 字体)/`light`(亮色: 白底+浅灰蓝面板+深藏青文字, 绿/红加深保证白底可读)。启动时 `load_theme_name()` 读 `theme.json`(运行时文件, 已 gitignore)后 `globals().update` 注入全部 `COLOR_*`/`FONT_FAMILY`/`FONT_SIZE`/`UI_RADIUS` —— 下游 206 处 `setStyleSheet` 引用零改动。原散落各 widget 的硬编码色(点价梯最优买/卖价块、深度条高亮、警报行闪烁、accent hover)已收编为主题键(`COLOR_BID_PRICE_BG` 等, classic/scifi 逐值保留)。K 线图表走独立 `CHART_COLOR_*` 深色常量, 不随主题变。顶栏「主题」下拉切换 → `save_theme_name` + 提示自动重启生效(内联样式构建时固化, 无法热切)。 |
 
 ---
 
@@ -414,6 +415,122 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
 
+- **2026-08-21 — v1.2.0 公开版**:同步私有开发版自 v1.1.0 后的稳定改进,并完成公开发布审查。
+  主要包括:行情订阅 reqId 全进程唯一与重复 ticker 自动重订;行情停滞自愈;自选启动即加载并支持
+  多条警报;委托显示实际成交均价;期权/正股一键平仓二次确认;非美元持仓与账户基础币种统一折算;
+  总资产实时外推与定期真值校准;自适应布局、三套主题、输入法卡顿规避及安装脚本。公开版移除了
+  机器专用端口和私有运维说明,Gateway 端口恢复官方默认并支持环境变量覆盖。
+  (`config.py`, `ibkr_engine.py`, `main_window.py`, `models.py`, `paper_engine.py`, `watchlist.py`,
+  `widgets/`, `setup.bat`, `requirements.txt`, `sounds/ALERT.wav`)
+
+- **2026-07-17** — **`setup.bat` 的 python 检查改为验版本+验 pip**;**修正 `start_gateway.bat`
+  写反的端口注释**。原检查只有 `python --version >nul` 判存在,当 PATH 中另一个较旧且没有 pip 的
+  Python 发行版排在前面时会误判通过,然后才在 pip 阶段报
+  `No module named pip`, 报错指向完全错误的方向。现在改为解析版本号 (`<3.13` 报 `:badpy`)、
+  再验 `python -m pip` (`:nopip`),并在报错里点破根因:**Windows 拼 PATH 是「系统级在前、用户级
+  在后」,装 Python 勾的 "Add to PATH" 只加到用户级,会被系统级的旧 python 压住**。
+  另 `start_gateway.bat` 注释原写 "4002=实盘, 4001=模拟盘",**两个端口写反了**;
+  IB Gateway 官方默认是 4001=实盘 / 4002=模拟盘。仅注释错误、不影响运行。
+  (`setup.bat`, `start_gateway.bat`)
+
+- **2026-07-15** — **监控 Tab: 每个标的支持任意多条到价警报 (右键追加)**。原每合约仅一条
+  高于价+一条低于价, 改为**警报列表**: 数据模型新增 `Alert` (方向 above/below + 价 + 会话内
+  id), `WatchItem.alert_above/below` 标量 → `alerts: list[Alert]` (`to_dict` 存 `alerts`,
+  `from_dict` 兼容并迁移旧标量格式)。Manager 换 `set_alert` 为 `add_alert/update_alert/
+  toggle_alert_direction/remove_alert`, `_tick` 逐条巡检、命中即移除 (仍一次性)。面板改为
+  **每条警报一行** (合约无警报时占一行占位): **右键任一行** → 「添加涨破/跌破警报」(弹价格框,
+  可无限追加, 如 TSLA 395/400/405) / 「移除该合约监控」; 单击「条件」列切 ≥/≤, 双击「警报价」
+  编辑 (留空/0 删该条), ✕ 删该条警报或占位行删整个合约; 触发时该合约所有行高亮。
+  (`watchlist.py`, `widgets/watch_panel.py`)
+- **2026-07-13** — **新增「亮色」主题 (白底) + 残留硬编码色收编主题化**。`THEMES` 加第三套
+  `light`: 白底/浅灰蓝面板 + 深藏青文字, 绿/红/琥珀加深保证白底可读, 行高亮改浅色配深字;
+  顶栏「主题」下拉三选一。同时把散落各 widget 的深色硬编码收编为主题键(classic/scifi
+  逐值保留, 零视觉回归): 点价梯最优买/卖价块底/字色、深度条行高亮/填充/文字高亮、自选
+  警报行闪烁色、accent 按钮 hover(`COLOR_ACCENT_HOVER`)、strategy_window 暗字/禁用态、
+  ES 动量震荡琥珀色(复用 `COLOR_MY_ORDER`)。K 线图表保持独立 `CHART_COLOR_*` 深色不随
+  主题变。(`config.py`, `widgets/price_ladder.py`, `widgets/option_chain.py`,
+  `widgets/watch_panel.py`, `widgets/strategy_window.py`, `widgets/symbol_bar.py`)
+- **2026-07-13** — **新增「简约科幻」主题, 顶栏可在经典/科幻间切换**。`config.py` 改为
+  `THEMES` 双主题字典 + `theme.json` 持久化, 启动时把选中主题的 `COLOR_*`/`FONT_FAMILY`/
+  `FONT_SIZE`/`UI_RADIUS` 注入模块全局 —— 15 个 widget 文件的 206 处样式引用零改动,
+  经典主题逐值保留原配色。科幻主题: 近黑深蓝底 + 电光青 accent + 霓虹绿/红, 文字提亮
+  (#e6f1ff)对比更清晰, 直角边框, Bahnschrift(DIN 风格)尖锐字体; `DARK_STYLESHEET` 追加
+  选中 Tab 顶部青色描边/输入框聚焦青边/表头字距等科幻专属规则。顶栏最右「主题」下拉
+  切换 → 保存 + 询问立即自动重启(内联样式构建时固化, 需重启生效); combo_analyzer 入口
+  字体同步走主题配置。(`config.py`, `main_window.py`, `widgets/symbol_bar.py`,
+  `widgets/price_ladder.py`, `main.py`, `main_gw.py`, `combo_analyzer*.py`, `.gitignore`)
+- **2026-07-13** — **双击期权合约联动跳到该到期日 Tab**。双击持仓/委托/监控里的期权
+  (C/P) 时, 期权链不再停在默认到期日: 同标的直接 `select_expiry` 选中该合约到期日的
+  Tab (不在当前 range 时自动切到第一个包含它的 range); 换标的则经
+  `_load_option_chain(jump_expiry=...)` 在链加载完成后跳。正股/期货/COMBO 不受影响。
+  (`widgets/option_chain.py` 新增 `select_expiry`, `main_window.py`)
+- **2026-07-10** — **监控 Tab 双击合约名跳点价梯/期权链**。与持仓/委托面板同款交互:
+  双击「监控」页某行的合约名, 载入该合约到点价梯+计算器, 期权自动切标的并重载期权链,
+  正股/期货切对应品种模式; ⚠≥/⚠≤ 列双击仍是编辑警报价, 互不干扰。
+  (`widgets/watch_panel.py` `option_selected`, `main_window.py`)
+- **2026-07-10** — **修非美元持仓市价/盈亏%显示错误**。根因: IBKR
+  `position` 回调的 avgCost 是**当地货币**, 而 `reqPnLSingle` 的
+  value/unrealizedPnL 是**基础货币 USD** — 面板把 USD 市值直接除以数量当"当地股价"、
+  把 USD 盈亏除以 TWD 成本算盈亏%, 全部错乱。修复: 非 USD 标的市价按
+  `均价×市值/(市值−浮盈亏)` 换算回当地货币; 盈亏% 一律用 USD 成本基础 (市值−浮盈亏);
+  均价/市价列非美元时标注货币代码,市值/盈亏保持 USD。
+  (`models.py` `pnl_pct`, `widgets/position_panel.py`)
+- **2026-07-10** — **修 Put 价差腿方向反了 + 多腿组合一键平仓**。① `strategy_defs.py` 两个
+  Put 垂直价差的腿与「strike1=低/strike2=高」约定不符: Bear Put 应**买高卖低**却买低卖高
+  (下出来实为 Bull Put 信用价差), Bull Put 应**卖高买低**却卖低买高 — 两者恰好互换, 已修正
+  (Call 价差/蝶式/铁鹰/跨式检查无误)。② 多腿组合本就以 IBKR **BAG 组合单**整体成交 (视为一个
+  整体买入); 新增「已开组合 (一键平仓)」区: 下单后自动记录 (持久化 `strategy_combos.json`,
+  gitignore, 成交标「持仓中」, 撤/拒单自动移除, 过期清理), 点「一键平仓」以**反向市价 BAG 单**
+  整体平掉 (确认框列明细); `place_combo_order` 新增 `market` 参数支持市价组合单。
+  (`widgets/strategy_defs.py`, `widgets/strategy_window.py`, `ibkr_engine.py`, `.gitignore`)
+- **2026-07-10** — **修正股碎股显示「数量 0 但有市值」**。持仓面板把 API 数量 `int()` 取整,
+  分红再投等产生的碎股 (如 0.6656 股) 显示成 0。改为保留原始小数: 整数正常显示, 碎股显示
+  最多 4 位小数 (如 0.6656)。(`widgets/position_panel.py`)
+- **2026-07-10** — **每笔提交后数量复位 1 + 卖空无条件拦截**。① 点价梯限价买卖/市价买卖/
+  平仓任一笔提交成功后, 「数量」自动复位为 1 (防上一笔的大数量残留误下)。② 防卖空从
+  「弹确认框可放行」升级为**无条件拦截**: 卖出量 > API 持仓的点价梯卖单直接拒绝并弹提示
+  (无放行按钮); 多腿组合的价差空腿不经此处、不受影响。(`main_window.py`
+  `_confirm_sell_to_open`, `widgets/price_ladder.py` `reset_quantity`)
+- **2026-07-10** — **「标的价」条件单支持监控任意标的 + 巡检加密到 0.2s**。① 「标的价」行
+  新增监控标的下拉 (默认「自己」= 本期权的标的; 预置 SPX/SPY/ES/NQ/QQQ/XSP/NDX, 可手输任意
+  代码), 如 SPY 期权可设 SPX 或 ES 到价市价卖出; ES/NQ 等期货自动解析近月合约订阅
+  (`ibkr_engine.subscribe_watch_tick`, 后台解析不卡 GUI, 行情统一落 `__stock__SYM` 键)。
+  换监控标的时触发价清零并按新标的现价重新播种; 挂单确认/已挂列表均显示监控标的名。
+  `ConditionalOrder` 新增 `watch_symbol` 字段 (持久化兼容旧 json)。② 条件单巡检间隔
+  500ms → **200ms** (用户要求)。手动卖出自动取消条件单时行情订阅一并退订 (原有逻辑,
+  含监控标的行情线)。(`models.py`, `conditional_orders.py`, `ibkr_engine.py`,
+  `paper_engine.py`, `main_window.py`, `widgets/price_ladder.py`)
+- **2026-07-10** — **手动卖出自动取消该合约条件单 + 修心跳定时器从未运行**。① 用户要求:
+  点价梯手动卖出 (限价/市价/平仓) 成功提交后, 自动取消该合约全部本地条件单并在状态栏提示
+  (残留条件单会在重新买入同合约时按旧触发价把新仓位卖掉); 条件单自身触发的卖出不受影响。
+  (`main_window.py` `_cancel_conds_on_manual_sell`) ② 日志排查发现: 心跳 QTimer 在后台
+  connect 线程创建, 违反 Qt 线程约束 → **定时器从未真正运行** (reader 线程死亡/行情超时监控
+  一直失效), 且每次连接/断开报 QObject::startTimer/killTimer 警告。改为 bridge.connected
+  信号驱动、在 GUI 线程启动; `_stop_heartbeat` 跨线程调用时经 QMetaObject.invokeMethod
+  队列到定时器所属线程。(`ibkr_engine.py`)
+- **2026-07-10** — **修条件单「标的价」残留勾选导致期权被立即卖出**。挂止损/止盈时,
+  「标的价」勾选残留 + 触发价被自动播种为**当时标的现价** → 静默一起挂出一条
+  「标的 ≥现价 → 市价卖」并可能立即触发。
+  三重修复 (`widgets/price_ladder.py`): ① 点「挂条件单」后**取消全部勾选** (止盈/止损/标的价,
+  用户要求) 并清零标的价输入, 每次挂单必须重新明确勾选; ② 挂单前核对各腿, 条件在**当前价下
+  已满足** (挂上即秒卖) 时列明细弹确认框 (默认 No); ③ 换合约时清空旧合约的触发价与勾选,
+  面板开着则按新合约现价重新播种 (播种逻辑抽为 `_seed_cond_prices`)。
+- **2026-07-10** — **修自选到价警报反复响 + RuntimeError**。根因: 触发警报后 `_highlight_row`
+  的 `setBackground` 触发 `itemChanged`, 被 `_on_item_changed` 当成用户编辑, 把刚清零的警报价
+  **重新设回去** → 每 0.5s 巡检反复触发; 且触发后表格重建销毁旧单元格, 3 秒后取消高亮的定时器
+  拿着失效引用报 `RuntimeError: QTableWidgetItem has been deleted`。修复: 高亮改走
+  `_set_row_background` (设背景期间置 `_rebuilding` 屏蔽 itemChanged; 取消高亮时按 key 重新查行,
+  行没了静默跳过), 且警报高亮延到表格重建后再画 (原先立即画会被重建抹掉)。现在到价只提醒一次。
+  (`widgets/watch_panel.py`)
+- **2026-07-09** — **防误卖空: 点价梯卖单超持仓时弹确认框**。点价梯停在未持仓合约时
+  误点「市价卖出」可能意外开出裸空腿。新增 `_confirm_sell_to_open`: 点价梯发起的
+  限价/市价**卖单**先按 API 持仓核对, 卖出量 > 持仓 (= 会开空) 时弹「将开出空头仓位」确认框
+  (默认 No; 持仓快照未就绪按 0 对待)。市价平仓按钮/条件单已有各自校验, 多腿组合 combo 不经此处。
+  (`main_window.py`)
+- **2026-07-09** — **到价警报音换成 misaka 语音**。用 GPT-SoVITS misaka v3 生成
+  `sounds/ALERT.wav`(日语「価格到達よ」, 1.6s), `play_alert()` 自动优先播放它 (无需改代码);
+  也可替换为自制的 `ALERT.wav` / `ALERT.mp3`。
+  (`sounds/ALERT.wav` 新增, `sounds/README.md`)
 - **2026-07-09** — **新增「自选监控 (watch list)」+ 修点价梯盘口空档消失**。
   ① **自选监控**: 点价梯左下角新增「☆ 加自选」按钮 (`watch_requested` 信号), 把当前合约加入
   **「监控」Tab** (`widgets/watch_panel.py`, right_tabs 第三页, 与持仓/委托同窗口点击切换,
@@ -677,7 +794,7 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
   重试次数 3→5(10/20/30/40/50)。③ 新增 `_base_client_id`:每次连接都从**标准 id**(10)起算重试,
   避免一次 326 退避后 `_client_id` 永久漂到 20/30。(`ibkr_engine.py`)
 - **2026-06-22** — **加「延迟行情自动回退」(修模拟盘看不到期货报价)**。根因:IBKR 行情订阅绑在实盘账户,
-  **模拟盘默认无行情**(未开"与模拟账户共享行情"),且本账户仅美股快照、无期货行情包 → 期货点价梯空白像"搜不到"。
+  **模拟盘默认无行情**(未开"与模拟账户共享行情"),且账户未订阅期货行情时点价梯会空白、看似"搜不到"。
   改:某合约报 **354 / 10168「未订阅实时行情」**时,引擎一次性 `reqMarketDataType(3)` 切**延迟行情**并按原 reqId
   重订当前所有行情线(已订阅实时的合约仍走实时);`IBKRApp` 加 `_tick_req_contract`(reqId→合约)与
   `_switch_to_delayed_and_resubscribe`。正解仍是去 IBKR Client Portal 给模拟盘**开启行情共享 / 订阅期货行情**。
@@ -685,7 +802,7 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 - **2026-06-22** — **修「期货搜不到」**:期货模式下搜索框改用**内置期货列表本地补全**(IBKR
   `reqMatchingSymbols`/`symbolSamples` 不返回期货根代码,之前结果被过滤成只剩 STK/IND/ETF → 期货永远搜不到);
   切到「期货」且当前标的非期货根代码时**自动填默认 `ES`** 并加载,免去"SPY 不在列表"的困惑。
-  注:期货**实时盘口**需账户有 CME 等期货行情订阅(本账户仅美股快照),无订阅时合约能解析、能下单,但点价梯无报价。
+  注:期货**实时盘口**需账户有 CME 等期货行情订阅,无订阅时合约能解析、能下单,但点价梯无报价。
   (`widgets/symbol_bar.py`, `main_window.py`)
 - **2026-06-22** — **期权 GUI 顶栏加「类型」三选一(期权/正股/期货),默认期权,可切正股/期货交易**。
   在 `SymbolBar` 顶栏最左加 `类型` 下拉(`期权`默认/`正股`/`期货`)+ 期货专用「合约月份」下拉
@@ -712,24 +829,16 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 - **2026-06-19** — **修复热切换后模式下拉/标的框卡死**。切换模式时 `set_switching(True)` 禁用了下拉+标的输入框,
   重连完成后从未复位 → 切到模拟/实盘后无法再改标的、无法再切回(实盘新连正常因为没走切换)。修复:
   `_on_connected` / `_on_disconnected` 开头调 `set_switching(False)` 复位。(`main_window.py`)
-- **2026-06-18** — **桌面快捷方式连带自动起 IBC 网关**。新增 `start_full_options.bat` / `start_full_stock.bat`:
-  netstat 查 4001 没监听则先用 IBC(`C:\IBC\StartGateway_live.bat`)起实盘 Gateway, 再开交易程序;桌面
-  「IBKR 点价交易/正股交易」改指这俩(图标保留)。IBC 用 `ReadOnlyApi=no`(修早先 code 321 只读拒单)、
-  `AutoRestartTime=05:00 AM`(一周内免重复 2FA)。launcher 起实盘(4001)+模拟(4002)两网关后 **轮询等 4001
-  就绪(最多~3分钟, 控制台显示进度, 超时 pause 不闪退)再开程序** —— 修"程序先于网关启动→连不上(502)像闪退"。
-  两网关都在线 → 顶栏「实盘⇄IBKR模拟盘」秒切。(`start_full_options.bat`, `start_full_stock.bat`, 桌面 .lnk, `C:\IBC\*`)
-- **2026-06-18** — **今日盈亏修好: dailyPnL 不可用时用 已实现+未实现 兜底**。日志实测: 本账户 reqPnL 的
-  `dailyPnL` **常年返回 DBL_MAX(不可用)**→ 被转 NaN → 显示「--」; 但同一回调的 `unrealizedPnL`/
-  `realizedPnL` **有效**(实测 realized=-168.79、unrealized=+16.67)。改法: `update_daily_pnl` 在 dailyPnL 为
-  NaN 时取 `realizedPnL + unrealizedPnL`(IBKR 的 realizedPnL 已含手续费), dailyPnL 可用时仍优先用它。
-  今日盈亏由「--」变为 ≈ -152。**同时撤回了之前两版错误尝试**(本地扣费 / 现金流+市值自算误显示 +$45931)。
+- **2026-06-18** — **今日盈亏修好: dailyPnL 不可用时用 已实现+未实现 兜底**。部分账户的 reqPnL
+  `dailyPnL` 会返回 DBL_MAX(不可用)并被转为 NaN,但同一回调的 `unrealizedPnL` / `realizedPnL`
+  仍有效。`update_daily_pnl` 在 dailyPnL 为 NaN 时取 `realizedPnL + unrealizedPnL`,
+  dailyPnL 可用时仍优先用它。
   (`ibkr_engine.py`, `widgets/account_bar.py`)
 - **2026-06-18** — **真正成交播放提示音**。新增 `sound_alerts.play_fill(side)`(后台线程播放,不卡 GUI):
   优先放 `sounds/BUY.(wav|mp3)` / `sounds/SELL.(wav|mp3)`(可用 GPT-SoVITS 生成),回退 `sounds/FILL.*`,
   再回退 winsound 蜂鸣(买升调/卖降调)。期权 GUI 与正股 client 均接 `execution_received`(仅真实引擎成交,
   本地模拟不响)。语音文件放 `sounds/` 即生效,无需改代码。**已用训练好的御坂美琴 misaka v3 模型生成
-  `sounds/BUY.wav`(日语「買い」)/`SELL.wav`(日语「売り」)**(脚本 `GPT-SoVITS-Training/.../gen_fill_voices2.py`,
-  走 inference_webui;api_v2 不支持 v3)。(`sound_alerts.py`, `sounds/`, `main_window.py`, `stock_trader.py`)
+  `sounds/BUY.wav`(日语「買い」)/`SELL.wav`(日语「売り」)**。(`sound_alerts.py`, `sounds/`, `main_window.py`, `stock_trader.py`)
 - **2026-06-18** — **修今日/未实现盈亏闪 0 + 重连后盈亏归 0**。① `request_pnl` 改**幂等**(reqPnL 是流式
   订阅,`account_summary_end` 每 3 秒会调它,原来每次 cancel+重订 → 重订瞬间初值不稳 → 闪 0;现已订阅则直接
   返回)。② **未实现盈亏单一来源**:reqPnL 流接管后,账户摘要里每 3 秒推来的 `UnrealizedPnL`(常为 0/陈旧)

@@ -2,6 +2,7 @@
 infinite scroll (load earlier data on pan), and real-time streaming/polling.
 """
 
+import os
 import threading
 import numpy as np
 
@@ -11,7 +12,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QComboBox, QCheckBox, QStatusBar,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QIcon
 
 from config import (
     CHART_TIMEFRAMES, DEFAULT_SYMBOLS,
@@ -23,6 +24,7 @@ from config import (
     COLOR_BORDER, COLOR_ACCENT,
 )
 from widgets.candlestick_item import CandlestickItem
+from widgets.ui_util import disable_ime
 from widgets.chart_indicators import IndicatorCalculator
 
 # Polling config for non-keepUpToDate timeframes: (interval_ms, duration_str)
@@ -102,12 +104,19 @@ class ChartWindow(QMainWindow):
         self._iv_key: str | None = None
 
         self.setWindowTitle(f"K线图 — {symbol}")
+        # 同 OptionChartWindow: 独立窗口不吃主窗口图标, 不设就是 pythonw 默认图标
+        _icon = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.ico"
+        )
+        if os.path.exists(_icon):
+            self.setWindowIcon(QIcon(_icon))
         self.setMinimumSize(900, 600)
         self.resize(1200, 750)
 
         self._build_ui()
         self._connect_signals()
         self._apply_style()
+        disable_ime(self)   # 见 ui_util: 别让搜狗挂上来
 
     def show_and_load(self):
         """Show window and trigger initial data load."""

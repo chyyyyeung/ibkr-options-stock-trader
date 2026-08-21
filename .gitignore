@@ -5,11 +5,13 @@ __pycache__/
 .venv/
 venv/
 
-# 运行时生成 (日志 / 拒单记录 / 组合持仓分组 / 本地条件单 / 自选监控)
+# 运行时生成 (日志 / 拒单记录 / 组合持仓分组 / 本地条件单 / 自选监控 / 主题选择)
 logs/
 combo_positions.json
 conditional_orders.json
 watchlist.json
+strategy_combos.json
+theme.json
 
 # 编辑器 / OS
 .vscode/

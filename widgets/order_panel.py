@@ -8,7 +8,7 @@ from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QBrush
 
 from config import COLOR_GREEN, COLOR_RED, COLOR_TEXT, COLOR_TEXT_DIM, COLOR_ACCENT
-from models import OrderInfo, OrderStatus, OrderAction
+from models import OrderInfo, OrderStatus, OrderAction, OrderType
 
 
 class OrderPanel(QWidget):
@@ -51,6 +51,10 @@ class OrderPanel(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
 
+        self.table.horizontalHeaderItem(4).setToolTip(
+            "已成交显示实际成交均价; 未成交显示委托价 (市价单显示「市价」)"
+        )
+
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
@@ -71,6 +75,23 @@ class OrderPanel(QWidget):
     def set_engine(self, engine):
         self._engine = engine
 
+    @staticmethod
+    def _price_text(order: OrderInfo) -> tuple[str, str]:
+        """价格列的文案 + tooltip。
+
+        **成交价优先**: 一旦有成交均价 (filled_price, 真实引擎来自 IBKR
+        avgFillPrice, 模拟引擎来自本地撮合) 就显示它 —— 这才是"我到底以多少钱
+        成交的"。此前这一列一律显示 limit_price, 结果:
+          - 正股/期货**市价单**根本没有限价 (limit_price=0) → 显示 $0.00;
+          - 期权市价单显示的是下单前的中间价参考值, 也不是成交价。
+        未成交时按订单类型区分: 限价单显示委托价, 市价单显示「市价」而不是 $0.00。
+        """
+        if order.filled_price > 0:
+            return f"${order.filled_price:.2f}", "实际成交均价"
+        if order.order_type == OrderType.MARKET:
+            return "市价", "市价单 — 成交后此处显示实际成交均价"
+        return f"${order.limit_price:.2f}", "委托价 (限价单)"
+
     def _refresh(self):
         if not self._engine:
             return
@@ -85,9 +106,13 @@ class OrderPanel(QWidget):
         # Skip the (expensive) rebuild when nothing visible changed — avoids
         # recreating cancel buttons and re-painting cells every second while
         # idle. Signature covers every field the table renders.
+        # 签名必须含 filled_price/filled_qty/order_type: 成交回报到来时 limit_price
+        # 并不变, 若签名只看 limit_price, 表格会被判定为"无变化"而跳过重绘,
+        # 成交价永远刷不出来。
         sig = tuple(
             (o.order_id, o.option.display_name, o.action, o.quantity,
-             o.limit_price, o.status, o.error_msg)
+             o.limit_price, o.filled_price, o.filled_qty, o.order_type,
+             o.status, o.error_msg)
             for o in sorted_orders
         )
         if sig == self._last_sig:
@@ -114,8 +139,10 @@ class OrderPanel(QWidget):
             # Quantity
             self._set_cell(row, 3, str(order.quantity), COLOR_TEXT)
 
-            # Price
-            self._set_cell(row, 4, f"${order.limit_price:.2f}", COLOR_TEXT)
+            # Price — 已成交显示成交均价, 未成交显示委托价 / 「市价」
+            price_txt, price_tip = self._price_text(order)
+            self._set_cell(row, 4, price_txt, COLOR_TEXT)
+            self.table.item(row, 4).setToolTip(price_tip)
 
             # Status (rejection reason shown as tooltip)
             status_color = self._status_color(order.status)

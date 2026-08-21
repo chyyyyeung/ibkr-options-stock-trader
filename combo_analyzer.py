@@ -1147,7 +1147,8 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
-    app.setFont(QFont("Segoe UI", 10))
+    from config import FONT_FAMILY, FONT_SIZE
+    app.setFont(QFont(FONT_FAMILY, FONT_SIZE))
     if os.path.exists(APP_ICON):
         app.setWindowIcon(QIcon(APP_ICON))
     window = ComboAnalyzerWindow()

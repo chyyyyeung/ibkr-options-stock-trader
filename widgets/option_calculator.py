@@ -33,6 +33,24 @@ from config import (
 )
 
 
+class KeyboardOnlySpinBox(QDoubleSpinBox):
+    """只允许**键盘**改值的数值框。
+
+    鼠标滚轮/拖拽在这里是纯粹的误操作来源: 滚动整个计算器面板时指针恰好掠过
+    某个输入框, 标的价/IV 就被悄悄改掉了, 而理论价会跟着变 —— 看上去像算错了。
+    这里把滚轮事件直接放行给父级 (面板照常滚动, 值不变), 并且不接受滚轮焦点;
+    上下调节按钮本来就已隐藏 (NoButtons)。键入数字、↑↓、PgUp/PgDn 均不受影响。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 只能点击/Tab 获得焦点, 滚轮不会先把焦点抢过来再改值
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()  # 不消费 → 交给外层滚动区域, 值保持不变
+
+
 # ── Black-Scholes ───────────────────────────────────────────────────────
 
 def _norm_cdf(x: float) -> float:
@@ -284,7 +302,8 @@ class OptionCalculator(QWidget):
 
     @staticmethod
     def _make_spin(decimals, maximum, step, suffix="", on_change=None):
-        sp = QDoubleSpinBox()
+        # 键盘专用: 滚轮/拖拽不改值 (见 KeyboardOnlySpinBox)
+        sp = KeyboardOnlySpinBox()
         sp.setDecimals(decimals)
         sp.setRange(0.0, maximum)
         sp.setSingleStep(step)
