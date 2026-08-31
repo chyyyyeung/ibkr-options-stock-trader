@@ -437,8 +437,10 @@ class MainWindow(QMainWindow):
         # Price ladder -> close position
         self.price_ladder.close_position_requested.connect(self._on_close_position_requested)
 
-        # Price ladder -> cancel all
-        self.price_ladder.cancel_all_requested.connect(self._on_cancel_all_requested)
+        # Price ladder -> 只撤当前合约挂单（绝不调用 IBKR 全局撤单）
+        self.price_ladder.cancel_symbol_requested.connect(
+            self._on_cancel_symbol_requested
+        )
 
         # Price ladder -> detach
         self.price_ladder.detach_requested.connect(self._on_detach_ladder)
@@ -482,6 +484,9 @@ class MainWindow(QMainWindow):
 
         # Order panel -> cancel
         self.order_panel.cancel_requested.connect(self._on_cancel_order)
+        self.order_panel.cancel_all_requested.connect(
+            self._on_cancel_all_orders_requested
+        )
 
         # 中央 Tab 切换 -> 进入「多腿组合」时懒加载期权链
         self.center_tabs.currentChanged.connect(self._on_center_tab_changed)
@@ -1387,10 +1392,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         self.right_tabs.setCurrentIndex(1)   # 跳到委托页看成交回报
 
-    def _on_cancel_all_requested(self):
-        """Handle cancel all orders from price ladder."""
+    def _on_cancel_symbol_requested(self, option: OptionInfo):
+        """点价梯撤单：只逐笔取消当前合约，绝不波及其他标的。"""
+        count = self._active_engine.cancel_orders_for_option(option)
+        if count:
+            self.statusBar().showMessage(
+                f"已请求取消 {option.display_name} 的 {count} 笔挂单；其他标的不受影响"
+            )
+        else:
+            self.statusBar().showMessage(f"{option.display_name} 当前没有可撤挂单")
+
+    def _on_cancel_all_orders_requested(self):
+        """委托面板全局撤单：确认由 OrderPanel 完成。"""
         self._active_engine.cancel_all_orders()
-        self.statusBar().showMessage("已请求取消所有挂单")
+        self.statusBar().showMessage("已请求取消全部标的的所有委托")
 
     def _on_cancel_order(self, order_id: int):
         self._active_engine.cancel_order(order_id)

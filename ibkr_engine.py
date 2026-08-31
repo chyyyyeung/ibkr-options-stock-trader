@@ -656,32 +656,12 @@ class IBKRApp(EWrapper, EClient):
         )
 
     def openOrder(self, orderId, contract, order, orderState):
-        # Build OptionInfo from contract for orders placed in prior sessions
-        # or via TWS directly.  Only track option orders.
-        if contract.secType == "OPT":
-            option = OptionInfo(
-                symbol=contract.symbol,
-                expiry=contract.lastTradeDateOrContractMonth,
-                strike=contract.strike,
-                right=contract.right,
-                con_id=contract.conId,
-            )
-            action = OrderAction.BUY if order.action == "BUY" else OrderAction.SELL
-            price = order.lmtPrice if order.orderType == "LMT" else 0.0
-            order_type = OrderType.LIMIT if order.orderType == "LMT" else OrderType.MARKET
-            self.bridge.open_order_received.emit(
-                orderId, option, action.value, int(order.totalQuantity),
-                price, order_type.value, orderState.status,
-            )
-        elif contract.secType == "BAG":
-            # Combo/spread order — track with synthetic OptionInfo
-            option = OptionInfo(
-                symbol=contract.symbol,
-                expiry="",
-                strike=0.0,
-                right="COMBO",
-                con_id=contract.conId,
-            )
+        # Track every instrument supported by the integrated ladder.  This is
+        # essential for targeted cancellation after a restart: an open stock or
+        # futures order must be present in `_orders` before it can be cancelled
+        # individually without falling back to the dangerous global cancel.
+        option = self._option_from_contract(contract)
+        if option is not None:
             action = OrderAction.BUY if order.action == "BUY" else OrderAction.SELL
             price = order.lmtPrice if order.orderType == "LMT" else 0.0
             order_type = OrderType.LIMIT if order.orderType == "LMT" else OrderType.MARKET
@@ -2306,9 +2286,35 @@ class IBKREngine:
         self._user_cancel_ids.add(order_id)
         self._app.cancelOrder(order_id)
 
+    def cancel_orders_for_option(self, option: OptionInfo) -> int:
+        """Cancel only pending orders for one exact ladder instrument.
+
+        Both BUY and SELL orders are included.  Matching uses IBKR conId when
+        available and the stable ladder key otherwise, so another contract can
+        never be swept in.  Returns the number of cancellation requests sent.
+        """
+        target_key = option.to_ibkr_key()
+        order_ids = [
+            order_id
+            for order_id, tracked in list(self._orders.items())
+            if tracked.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)
+            and tracked.option.same_instrument_as(option)
+        ]
+        print(
+            f"[ORDER] Cancelling {len(order_ids)} order(s) for "
+            f"{option.display_name} key={target_key}",
+            flush=True,
+        )
+        for order_id in order_ids:
+            self.cancel_order(order_id)
+        return len(order_ids)
+
     def cancel_all_orders(self):
         """Cancel all open orders (including those placed in prior sessions)."""
-        self._user_cancel_ids.update(self._orders.keys())
+        self._user_cancel_ids.update(
+            order_id for order_id, order in self._orders.items()
+            if order.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)
+        )
         self._app.reqGlobalCancel()
 
     def close_position(self, option: OptionInfo,

@@ -1,13 +1,16 @@
 """Order panel — displays pending and recent orders with cancel support."""
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView, QLabel, QPushButton, QMessageBox,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QBrush
 
-from config import COLOR_GREEN, COLOR_RED, COLOR_TEXT, COLOR_TEXT_DIM, COLOR_ACCENT
+from config import (
+    COLOR_GREEN, COLOR_RED, COLOR_TEXT, COLOR_TEXT_DIM, COLOR_ACCENT,
+    COLOR_BG_DARK, COLOR_BORDER,
+)
 from models import OrderInfo, OrderStatus, OrderAction, OrderType
 
 
@@ -15,6 +18,7 @@ class OrderPanel(QWidget):
     """Displays orders with cancel buttons."""
 
     cancel_requested = pyqtSignal(int)  # orderId
+    cancel_all_requested = pyqtSignal()  # 全账户/全部标的挂单
     option_selected = pyqtSignal(object)  # OptionInfo — 双击委托行跳到该合约
 
     def __init__(self, parent=None):
@@ -40,9 +44,34 @@ class OrderPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+
         self.title = QLabel("委托")
         self.title.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
-        layout.addWidget(self.title)
+        top_layout.addWidget(self.title)
+        top_layout.addStretch()
+
+        self.cancel_all_btn = QPushButton("取消所有委托")
+        self.cancel_all_btn.setCursor(Qt.PointingHandCursor)
+        self.cancel_all_btn.setToolTip(
+            "取消全部标的的所有买入/卖出挂单（包括其他 API/TWS 窗口中的挂单）"
+        )
+        self.cancel_all_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_BG_DARK};
+                color: {COLOR_RED};
+                border: 1px solid {COLOR_RED};
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ background-color: {COLOR_RED}; color: #ffffff; }}
+        """)
+        self.cancel_all_btn.clicked.connect(self._on_cancel_all)
+        top_layout.addWidget(self.cancel_all_btn)
+
+        layout.addLayout(top_layout)
 
         headers = ["ID", "合约", "方向", "数量", "价格", "状态", "操作"]
         self.table = QTableWidget(0, len(headers))
@@ -74,6 +103,7 @@ class OrderPanel(QWidget):
 
     def set_engine(self, engine):
         self._engine = engine
+        self._last_sig = None
 
     @staticmethod
     def _price_text(order: OrderInfo) -> tuple[str, str]:
@@ -197,6 +227,28 @@ class OrderPanel(QWidget):
 
     def _on_cancel(self, order_id: int):
         self.cancel_requested.emit(order_id)
+
+    def _on_cancel_all(self):
+        """全局撤单始终二次确认；点价梯的「无需确认」不适用于这里。"""
+        if self._engine is None:
+            QMessageBox.information(self, "取消所有委托", "尚未连接，无法撤单。")
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("⚠ 取消所有委托")
+        box.setTextFormat(Qt.PlainText)
+        box.setText(
+            "确认取消全部标的的所有买入和卖出挂单？\n\n"
+            "在 IBKR 模式下，这也可能取消由其他 API 客户端或 TWS 窗口创建的挂单。\n"
+            "如只想撤当前合约，请使用点价梯的「取消本标的挂单」。"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("确认全部撤单")
+        box.button(QMessageBox.No).setText("返回")
+        if box.exec_() == QMessageBox.Yes:
+            self.cancel_all_requested.emit()
 
     def cleanup(self):
         self._refresh_timer.stop()

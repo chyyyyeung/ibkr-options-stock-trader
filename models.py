@@ -100,6 +100,19 @@ class OptionInfo:
             return f"__fut__{self.symbol}_{mon}"
         return f"{self.symbol}_{self.expiry}_{self.right}_{self.strike}"
 
+    def same_instrument_as(self, other: "OptionInfo") -> bool:
+        """Whether two records identify the same tradable contract.
+
+        IBKR's conId is authoritative when both sides have one.  The stable
+        ladder key is the fallback for locally-created/pseudo contracts whose
+        conId has not been resolved yet.
+        """
+        if not isinstance(other, OptionInfo):
+            return False
+        if self.con_id > 0 and other.con_id > 0:
+            return self.con_id == other.con_id
+        return self.to_ibkr_key() == other.to_ibkr_key()
+
 
 @dataclass
 class OrderInfo:

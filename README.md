@@ -5,7 +5,7 @@
 (`combo_analyzer.py`,clientId=12)。核心特性:Futu 风格点价梯(深度摆盘 + 点击下单)、
 期权 T 型报价链、多腿组合策略、K 线图、实时持仓与每仓位今日盈亏、真实/模拟双引擎切换。
 
-**当前公开版本: `v1.2.0` (2026-08-21)。**
+**当前公开版本: `v1.3.0` (2026-08-31)。**
 
 > **📌 维护约定(必读)**:本文件是 `ibkr_trader/` 的**唯一总体文档**,作为活文档维护。
 > **每次改动本目录的代码(新增/删除文件、改架构、改配置、修 bug、调行为)后,必须同步更新本文件**:
@@ -73,6 +73,8 @@ ibkr_trader/
 ├── check_spx_options.py    # 独立诊断脚本: 探测 SPX 期权合约/交易时段
 ├── check_option_history.py # 独立诊断脚本: 检测账户是否有「期权历史数据」权限 (clientId=99)
 ├── app.ico / app_icon.png  # 期权 GUI 图标 (期权 GUI + 组合分析器共用)
+├── tests/
+│   └── test_order_actions.py # 撤单隔离 + 最新 Bid 限价卖出安全测试
 ├── logs/                   # 运行日志 + 拒单日志 (自动生成)
 │   ├── app_YYYY-MM-DD.log          # 期权 GUI 控制台输出
 │   ├── combo_app_YYYY-MM-DD.log    # 组合分析器控制台输出
@@ -170,7 +172,8 @@ ibkr_trader/
   `TradingMode`(Paper 本地模拟 / IBKRPaper IBKR模拟盘 / Live 实盘;含 `label`/`uses_ibkr_engine`/`is_live_port`)、
   `InstrumentType`(OPT/STK/ETF)、`OrderType`(LMT/MKT)。
 - **`OptionInfo`** — 单个期权合约。`display_name`(如 `SPY 260516 C 585`,正股显示 `SYM (正股)`)、
-  `mid`、`to_ibkr_key()`(tick 订阅唯一键;正股共用 `__stock__SYM` 键空间)。
+  `mid`、`to_ibkr_key()`(tick 订阅唯一键;正股共用 `__stock__SYM` 键空间)、
+  `same_instrument_as()`(优先以 IBKR `conId` 精确判断同一可交易合约,无 conId 时回退稳定键)。
 - **`OrderInfo`** — 委托。含 `error_msg`(拒单原因)、`display_action`/`display_status`(中文)。
 - **`PositionInfo`** — 期权持仓。`unrealized_pnl`/`net_pnl`(减佣金)/`pnl_pct`/`market_value`/`cost_basis`。
 - **`AccountSummary`** — 账户净值/现金/购买力/盈亏。
@@ -210,7 +213,8 @@ ibkr_trader/
 - 账户/持仓/盈亏:`request_account_summary`、`request_positions`、`request_pnl`、
   `request_pnl_single`(每仓位今日盈亏)及各自 `cancel_*`。
 - **下单**:`place_limit_order`、`place_market_order`、`place_stock_order`、`place_forex_order`、
-  `place_combo_order`(多腿组合)、`cancel_order`、`cancel_all_orders`、`close_position`。
+  `place_combo_order`(多腿组合)、`cancel_order`、`cancel_orders_for_option`(只逐笔撤指定合约的
+  买/卖挂单)、`cancel_all_orders`(IBKR 全局撤单,只由委托页入口调用)、`close_position`。
 - 拒单处理:`_on_order_error`(非用户撤单/纯警告才报错)、`_log_rejection`(追加写
   `logs/order_rejects_*.jsonl`,含拒单时刻盘口/持仓/在途订单快照)、`_on_order_status`、`_on_execution`、
   `_on_open_order`(重连/重启恢复 TWS 中**仍在挂的**订单, 也复用给完成单恢复)。
@@ -238,7 +242,8 @@ ibkr_trader/
   (买入前 `_resolve_buy_bracket` 决定是否附带止盈/止损: 期货强制、期权勾「随买入单附带」时;
   `_arm_buy_bracket` 挂出、`_trigger_price` 把期货点数换算绝对价、`_pending_buy_brackets` +
   `_on_exec_arm_bracket` 在成交回报后挂)、
-  `_on_close_position_requested`、`_on_cancel_all_requested`/`_on_cancel_order`、
+  `_on_close_position_requested`、`_on_cancel_symbol_requested`(点价梯,仅当前合约)/
+  `_on_cancel_all_orders_requested`(委托页,全局)/`_on_cancel_order`、
   `_on_open_chart`(懒加载 ChartWindow)、
   `_on_detach_ladder`/`_on_reattach_ladder`(点价梯独立窗口)、`_update_session_indicator`(SPX GTH/RTH/Curb)、
   `_on_error`/`_on_order_rejected`(弹窗 + 状态栏标红)、`closeEvent`。
@@ -249,10 +254,10 @@ ibkr_trader/
 |------|-----------|
 | `symbol_bar.py` (≈380) | 顶栏最左**「类型」三选一**(期权默认/正股/期货,`instrument_changed`)+ 期货**「合约月份」下拉**(`future_expiry_changed`,`populate_future_expiries`);代码搜索框(`QListWidget` 自动补全,走 `symbol_search_results`)+ 连接状态灯 + 模式 `QComboBox`(本地模拟 / IBKR模拟盘 / 实盘,item data 存 `TradingMode.value`,切到实盘弹确认);最右**「主题」下拉**(经典/科幻,`theme_changed` → 主窗口保存并提示重启,见 §5 主题行)。 |
 | `option_chain.py` (≈520) | T 型报价表;按到期日分 Tab,顶部日期范围过滤(每范围最多 `MAX_EXPIRY_TABS_PER_RANGE` 个 Tab)+ **「🔄 刷新报价」按钮**;ATM 行高亮。**报价改用一次性快照**(`snapshot_option_tick`,切 Tab / 点按钮各拉一次,用完即弃**不占常驻行情线**),解决 Gateway 行情线紧张时整条链(含 TSLA)无数据;受 `MAX_SIMULTANEOUS_STREAMS` 限制每批快照数。**双击**某合约 → 打开该期权**当日 1 分钟图**(`chart_requested` → `option_chart_window.py`; 单击载入点价梯不变)。`select_expiry(expiry)`:外部(双击持仓/委托/监控的期权)联动选中指定到期日 Tab,不在当前 range 时自动切 range。 |
-| `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓、取消所有订单;tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + **标的价触发行** + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。**两种用法**:「挂条件单」按钮对**当前持仓**挂;勾「**随买入单附带**」(`attach_to_buy()`)则开仓时按买入数量自动附带。**标的价触发**(仅期权):勾「标的价」+ 选方向(≥涨到/≤跌到)+ 填标的触发价 → 监控**标的**价, 到价即对本期权发**市价卖出**(本地监控; `arm(...,watch="UNDER",market=True)`)。**期货**条件单输入切到「**+点/−点**」(`_sync_cond_input_mode()`,相对入场价),`get_bracket(require_both)` 返回带 `by_points` 的配置;`open_cond_panel()` 展开面板。 |
+| `price_ladder.py` (★, ≈1500) | Futu 风格 5 列摆盘(我的买单/买量/价格/卖量/我的卖单)+ 深度条可视化;点击价格即下限价单;含合约搜索、数量选择、确认勾选、持仓摘要、市价买/卖/平仓。**「最新买价卖出」**读取点击瞬间的有效实时 Bid 并发 `SELL LMT`(无 Bid/行情停滞则拒绝,绝不退化成市价单或旧价);**「取消本标的挂单」**只撤当前精确合约的全部买/卖挂单,不调用全局撤单、不影响其他标的。tick size 由 `_tick_sizes()` 按品种(正股 penny / 期货 `FUTURES_SPECS` / 指数 `TICK_SIZE_OVERRIDES` / 期权 penny-pilot)给出;确认框单位按品种(张/股/手)。**「条件单」面板**:止盈/止损(可单选)+ 触发价/数量 + 本地或 IBKR 原生 + **标的价触发行** + 已挂列表;`conditional_requested`/`conditional_cancel_requested`/`option_loaded` 信号交主窗口接 `ConditionalOrderManager`。**两种用法**:「挂条件单」按钮对**当前持仓**挂;勾「**随买入单附带**」(`attach_to_buy()`)则开仓时按买入数量自动附带。**标的价触发**(仅期权):勾「标的价」+ 选方向(≥涨到/≤跌到)+ 填标的触发价 → 监控**标的**价, 到价即对本期权发**市价卖出**(本地监控; `arm(...,watch="UNDER",market=True)`)。**期货**条件单输入切到「**+点/−点**」(`_sync_cond_input_mode()`,相对入场价),`get_bracket(require_both)` 返回带 `by_points` 的配置;`open_cond_panel()` 展开面板。 |
 | `watch_panel.py` (≈220) | **自选监控面板** (right_tabs 第三个 Tab「监控」, 与持仓/委托同窗口点击切换)。表: 合约/现价/⚠≥/⚠≤/✕; 点价梯左下「☆ 加自选」把当前合约加入并自动切到该 Tab; 现价 0.5s 刷新 (Tab 不可见时跳过重绘, 警报巡检照常); 双击警报列编辑触发价 (空=关, 一次性触发后自动清除); 触发 = 声音(`sound_alerts.play_alert`, sounds/ALERT 可自定义) + 非模态弹窗 + 行高亮 3s + 状态栏。逻辑在根目录 `watchlist.py` (WatchListManager)。 |
 | `position_panel.py` (318) | 持仓表。**真实模式持仓全部来自 IBKR API**(`portfolio_position_received` = reqPositions + `reqPnLSingle` 盈亏),不依赖本地成交跟踪,故无幻影持仓/数目准;模拟模式来自 `PaperEngine` 本地撮合。显示未实现盈亏、今日盈亏、百分比、可按类型筛选;「费$」后缀 = 该合约**今日实际佣金**(`get_position_commission`)。 |
-| `order_panel.py` (141) | 挂单/历史委托表;撤单按钮;拒单行标红,悬停看原因。**重启后自动加载当日已完成委托**(引擎 `reqCompletedOrders`,见 §4.3)。 |
+| `order_panel.py` (≈230) | 挂单/历史委托表;单笔撤单按钮;拒单行标红,悬停看原因。顶部**「取消所有委托」**是唯一全局撤单入口,始终二次确认并明确提示会取消其他 API/TWS 窗口挂单。**重启后自动加载当日已完成委托**(引擎 `reqCompletedOrders`,见 §4.3)。 |
 | `account_bar.py` (≈270) | 账户摘要条,**两行布局**(窄屏单行会截断,故拆开):**第一行**=资金摘要(总资产/可用/购买力/未实现/今日盈亏 + 右侧**今日手续费**,`on_computed_daily` 取 `computed_daily_pnl` 信号的手续费分量,真实=IBKR commissionReport 日内累计,模拟=各笔估算佣金累计;**今日盈亏=IBKR dailyPnL**(较昨收、含费),仅当 dailyPnL 本会话从未有效时才用 已实现+未实现 兜底——两口径对隔夜仓差异大,不混用以免显示跳变);**第二行**=账户名(左)+ **美东时间实时时钟**(右,`_update_clock` 每秒刷新 `America/New_York`,无 tz 数据回退本地)。**币种余额条已从账户栏移除**(`on_currency_balance` 保留为空槽,数据仍在引擎侧流动,不动主窗口信号接线)。每 `ACCOUNT_REFRESH_MS` (3s) 调 `request_account_summary()` + `request_currency_balances()`,但这两者已**幂等**(订一次流式订阅, 之后调用直接返回, 不再 cancel+重订), 故定时器只是兜底、不再给 Gateway 制造 churn。 |
 | `currency_balance.py` (≈70) | 各币种现金余额单行标签(`币种: EUR €414.00  USD $0.00`)。订阅引擎 `currency_balance_updated`(来自 `reqAccountSummary "$LEDGER:ALL"` 的 `CashBalance` 行);非零币种排前、含 0 余额也显示;**现仅正股 client 顶栏在用**(期权 GUI 账户栏已不再嵌)。 |
 | `option_calculator.py` (≈610) | **期权理论价计算器**(主窗口右下角),**两列布局**。**左列「正向·理论价」**:跟随左侧待交易期权,用 IBKR 推送的 IV + 标的价 + 行权价 + 剩余到期时间跑 Black-Scholes 算「应有价格」,并与盘口中间价比对(偏贵标红/偏便宜标绿);QTimer 每 `CALCULATOR_REFRESH_MS`(700ms)刷新(随行情 + 时间衰减);取消「跟随实时」进入手动 what-if(改 S/IV/利率/天数)。**右列「反向·试算」**:顶部单选切换两个方向,共享一组参数(K/IV/r/到期):**①「期权价→标的价」**(原功能)改**目标期权价**,用单调二分法 `solve_underlying_for_price` 反推「期权要值目标价时标的需到的价位」,对比当前标的算需变动金额/百分比(↑绿/↓红),Put 目标价超 `K·e^(-rT)` 显示「无解」;**②「标的价→期权价」**(新增)改**假设标的价**,正算 Black-Scholes 期权价并与盘口中间价比对(相对盘口涨跌, ↑绿/↓红, 到期则取内在价值)。换合约时自动用实时值播种(目标价取盘口中价、假设标的取当前标的),「↺ 用实时值填充」可手动重置。正股伪合约两列均显示「仅期权适用」。 |
@@ -414,6 +419,17 @@ ActiveX and Socket Clients),再双击 `start_gateway.bat`。在 GUI 顶栏选「
 ## 8. 变更记录 (Changelog)
 
 > 倒序排列,最新在上。每次改动本目录代码后追加一行:**日期 — 一句话说明(涉及文件)**。
+
+- **2026-08-31 — v1.3.0 公开版**:**撤单作用域拆分 + 最新 Bid 限价卖出**。点价梯原
+  「取消所有订单」改为「取消本标的挂单」:真实/本地模拟引擎按 `conId`(无 conId 才回退
+  合约键)筛出当前精确合约的 Pending/Submitted 买入与卖出单并逐笔撤销,不再调用
+  `reqGlobalCancel`,其他标的绝不受影响;`openOrder` 同时恢复期权/正股/期货/组合挂单,保证
+  重启后的正股/期货也可定向撤单。委托页顶部新增带强制二次确认的「取消所有委托」,作为
+  唯一 `reqGlobalCancel` 入口。点价梯另增「最新买价卖出」,读取点击瞬间实时 Bid 提交
+  `SELL LMT`;无有效 Bid 或行情停滞时 fail closed,不使用缓存旧价且绝不降级市价单。新增
+  5 项安全回归测试覆盖合约隔离、买卖双向、全局入口与 Bid 限价路径。
+  (`models.py`, `ibkr_engine.py`, `paper_engine.py`, `main_window.py`,
+  `widgets/price_ladder.py`, `widgets/order_panel.py`, `tests/test_order_actions.py`)
 
 - **2026-08-21 — v1.2.0 公开版**:同步私有开发版自 v1.1.0 后的稳定改进,并完成公开发布审查。
   主要包括:行情订阅 reqId 全进程唯一与重复 ticker 自动重订;行情停滞自愈;自选启动即加载并支持

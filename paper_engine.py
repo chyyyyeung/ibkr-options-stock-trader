@@ -402,6 +402,18 @@ class PaperEngine:
                 order_id, OrderStatus.CANCELLED.value, 0, 0, 0
             )
 
+    def cancel_orders_for_option(self, option: OptionInfo) -> int:
+        """Cancel both BUY and SELL pending orders for one exact instrument."""
+        order_ids = [
+            order_id
+            for order_id, order in list(self._orders.items())
+            if order.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED)
+            and order.option.same_instrument_as(option)
+        ]
+        for order_id in order_ids:
+            self.cancel_order(order_id)
+        return len(order_ids)
+
     def cancel_all_orders(self):
         """Cancel all pending orders."""
         for order_id, order in list(self._orders.items()):

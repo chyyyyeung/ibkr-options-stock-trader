@@ -6,11 +6,12 @@ Layout (top to bottom):
   - Contract display label
   - Confirm checkbox
   - Position summary row
-  - Action buttons: 市价买入 | 市价卖出 | 市价平仓 | 取消所有订单
+  - Action buttons: 市价买入 | 市价卖出 | 最新买价卖出 | 市价平仓 | 取消本标的挂单
   - Column headers: 我的买单 | 买入量 | 价格 | 卖出量 | 我的卖单
   - Scrollable order book rows with depth bar visualization
 """
 
+import math
 import re
 import threading
 import time
@@ -322,7 +323,7 @@ class PriceLadder(QWidget):
     contract_searched = pyqtSignal(object)             # OptionInfo from search bar
     market_order_requested = pyqtSignal(object, str)   # OptionInfo, "BUY"/"SELL"
     close_position_requested = pyqtSignal(object)      # OptionInfo
-    cancel_all_requested = pyqtSignal()
+    cancel_symbol_requested = pyqtSignal(object)       # 当前 OptionInfo, 只撤该合约挂单
     detach_requested = pyqtSignal()                    # Detach into standalone window
     conditional_requested = pyqtSignal(object)         # dict: 止盈/止损条件单请求
     conditional_cancel_requested = pyqtSignal(int)     # cond_id
@@ -647,6 +648,26 @@ class PriceLadder(QWidget):
         self.market_sell_btn.clicked.connect(self._on_market_sell)
         btn_layout.addWidget(self.market_sell_btn)
 
+        self.sell_at_bid_btn = QPushButton("最新买价卖出")
+        self.sell_at_bid_btn.setFixedHeight(32)
+        self.sell_at_bid_btn.setCursor(Qt.PointingHandCursor)
+        self.sell_at_bid_btn.setToolTip(
+            "按点击瞬间的最新买一价（Bid）提交卖出限价单；不是市价单"
+        )
+        self.sell_at_bid_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLOR_BG_DARK};
+                color: {COLOR_SELL};
+                border: 1px solid {COLOR_SELL};
+                border-radius: 3px;
+                font-weight: bold;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background-color: {COLOR_SELL}; color: white; }}
+        """)
+        self.sell_at_bid_btn.clicked.connect(self._on_sell_at_latest_bid)
+        btn_layout.addWidget(self.sell_at_bid_btn)
+
         self.close_pos_btn = QPushButton("市价平仓")
         self.close_pos_btn.setFixedHeight(32)
         self.close_pos_btn.setStyleSheet(f"""
@@ -662,9 +683,12 @@ class PriceLadder(QWidget):
         self.close_pos_btn.clicked.connect(self._on_close_position)
         btn_layout.addWidget(self.close_pos_btn)
 
-        self.cancel_all_btn = QPushButton("取消所有订单")
-        self.cancel_all_btn.setFixedHeight(32)
-        self.cancel_all_btn.setStyleSheet(f"""
+        self.cancel_symbol_btn = QPushButton("取消本标的挂单")
+        self.cancel_symbol_btn.setFixedHeight(32)
+        self.cancel_symbol_btn.setToolTip(
+            "仅取消当前点价梯合约的全部买入/卖出挂单，不影响其他标的"
+        )
+        self.cancel_symbol_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {COLOR_BG_DARK};
                 color: {COLOR_TEXT};
@@ -674,8 +698,8 @@ class PriceLadder(QWidget):
             }}
             QPushButton:hover {{ background-color: {COLOR_BORDER}; }}
         """)
-        self.cancel_all_btn.clicked.connect(self._on_cancel_all)
-        btn_layout.addWidget(self.cancel_all_btn)
+        self.cancel_symbol_btn.clicked.connect(self._on_cancel_symbol)
+        btn_layout.addWidget(self.cancel_symbol_btn)
 
         main_layout.addLayout(btn_layout)
 
@@ -1828,6 +1852,29 @@ class PriceLadder(QWidget):
                     return
             self.market_order_requested.emit(self._option, "SELL")
 
+    def _on_sell_at_latest_bid(self):
+        """Submit a SELL LMT at the raw latest Bid, never a market order.
+
+        Deliberately do not fall back to `_last_bid`: that value exists only to
+        keep the ladder visually stable through quote gaps and may be stale.
+        A one-click execution helper must fail closed when no live Bid exists.
+        """
+        if self._option is None or self._engine is None:
+            return
+        tick = self._engine.get_tick(self._option.to_ibkr_key())
+        try:
+            bid = float(tick.get("bid", 0) or 0)
+        except (TypeError, ValueError):
+            bid = 0.0
+        if not math.isfinite(bid) or bid <= 0 or self._stale_shown:
+            QMessageBox.warning(
+                self, "无法按最新买价卖出",
+                "当前没有有效的实时买一价（Bid），或该合约行情已经停滞。\n"
+                "为避免按 0 或旧价格下单，本次没有提交任何订单。",
+            )
+            return
+        self._on_sell(bid)
+
     def _on_close_position(self):
         if self._option:
             key = self._option.to_ibkr_key()
@@ -1846,16 +1893,20 @@ class PriceLadder(QWidget):
                     return
             self.close_position_requested.emit(self._option)
 
-    def _on_cancel_all(self):
+    def _on_cancel_symbol(self):
+        if self._option is None:
+            return
         if not self.no_confirm_checkbox.isChecked():
             reply = QMessageBox.question(
                 self, "确认取消",
-                "确认取消所有挂单？",
+                f"确认取消当前标的的全部买入/卖出挂单？\n"
+                f"{self._option.display_name}\n\n"
+                "其他标的的挂单不会受影响。",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 return
-        self.cancel_all_requested.emit()
+        self.cancel_symbol_requested.emit(self._option)
 
     # ── Price Button Clicks ────────────────────────────────────────────
 
